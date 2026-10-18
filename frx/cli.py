@@ -75,7 +75,8 @@ def cmd_run(args) -> int:
         ctx = Context(
             runner=runner, findings=findings, queue=queue, formats=formats,
             needles=needles, case_dir=case_dir, mode=args.mode, wordlist=cfg.wordlist,
-            logfn=runlog.line,
+            vol_symbols=cfg.vol_symbols, build_isf=args.build_isf, system_map=args.system_map,
+            vol_plugin_timeout=cfg.vol_plugin_timeout, logfn=runlog.line,
         )
         _wire_decoder(ctx)
         engine = Engine(ctx)
@@ -131,6 +132,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--flag-regex", action="append", help="raw regex (repeatable)")
     r.add_argument("--kind", help="force input kind (memory, pcap, disk, ...)")
     r.add_argument("--wordlist", help="wordlist for archive/stego brute force")
+    r.add_argument("--build-isf", dest="build_isf", metavar="VMLINUX",
+                   help="build a vol3 Linux ISF from this vmlinux via dwarf2json, then analyze")
+    r.add_argument("--system-map", dest="system_map", help="System.map for --build-isf")
     r.add_argument("--case", help="case dir (default cases/<timestamp>)")
     r.add_argument("--max-runtime", help="soft budget, e.g. 40m")
     r.add_argument("--max-depth", type=int)

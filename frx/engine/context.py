@@ -29,6 +29,10 @@ class Context:
     case_dir: Path
     mode: str = "full"  # "recon" or "full"
     wordlist: Optional[str] = None
+    vol_symbols: Optional[str] = None
+    build_isf: Optional[str] = None
+    system_map: Optional[str] = None
+    vol_plugin_timeout: float = 300.0
     max_inmem: int = 64 * 1024**2  # scan raw bytes directly below this size
     decoder: Any = None  # set by the engine once the decode engine exists
     logfn: Optional[Callable[[str], None]] = None

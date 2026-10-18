@@ -18,6 +18,8 @@ ROUTING: dict[str, list[str]] = {
     "pcap": ["pcap"],
     "image": ["image"],
     "document": ["document"],
+    "memory_raw": ["memory"],
+    "memory_win": ["memory"],
 }
 UNIVERSAL = ["binary"]
 
