@@ -1,0 +1,192 @@
+"""Recursive decode engine (spec section 8, amendment A3).
+
+Given a candidate blob (a needle-hit window, a bulk_extractor feature, or a long
+high-purity run), try the applicable reducing codecs and the conditional
+transforms, score each result, and recurse on the promising ones until a flag
+regex matches (terminal success) or the depth/op budget runs out. The decode
+chain is recorded in provenance, e.g. base64 -> hex -> rot13 -> CTF{...}.
+
+Gating keeps recursion from exploding:
+- reducing codecs (base64/hex/...) recurse when the result scores >= threshold;
+- conditional transforms (rot-n/rot47/atbash/reverse/xor) recurse only on real
+  evidence: a flag prefix appears, the English score clearly improves, or the
+  output enters a stricter charset class (e.g. rot13 turning [0-9n-s] into hex).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+
+from ..flags.scan import scan_flags
+from ..report.findings import Finding
+from . import classic, codecs, detect
+from .score import english_score, score_text
+
+MAX_DEPTH = 5
+THRESHOLD = 0.5
+PER_CALL_OPS = 8000
+ENGLISH_MARGIN = 0.15
+MAX_CANDIDATES_PER_ITEM = 50
+MIN_DIVERSITY = 4  # a blob with fewer distinct bytes cannot hold a flag
+XOR_MAX_LEN = 2048  # single-byte XOR brute only on short tokens
+
+
+def _too_dull(data: bytes) -> bool:
+    return len(set(data)) < MIN_DIVERSITY
+
+
+@dataclasses.dataclass
+class _State:
+    ops: int = 0
+    visited: set = dataclasses.field(default_factory=set)
+
+
+class DecodeEngine:
+    def __init__(self, ctx, max_depth: int = MAX_DEPTH, threshold: float = THRESHOLD):
+        self.ctx = ctx
+        self.max_depth = max_depth
+        self.threshold = threshold
+        self._prefixes = [f.prefix.encode() for f in ctx.formats if f.prefix]
+        self._cand_counts: dict[str, int] = {}
+        self._cand_seen: dict[str, set] = {}
+
+    # -- public entry ---------------------------------------------------
+    def decode_candidate(self, blob: bytes, item, base_provenance: list[str]) -> None:
+        """Decode a candidate blob.
+
+        Each top-level high-purity token gets its own op budget so a pile of
+        junk tokens cannot starve a real (possibly last) one. Whole-blob
+        structural codecs and the recursion they spawn share one budget.
+        """
+        if not blob:
+            return
+        # A flag may already be literally present.
+        self._emit_flags(blob, item, base_provenance)
+        # Whole-blob structural codecs (url/quopri/utf16/morse/decimal/binary).
+        self._structural(blob, item, base_provenance, depth=0, state=_State())
+        # Each high-purity run with a fresh budget.
+        for token in detect.extract_tokens(blob):
+            self._token(token, item, base_provenance, depth=0, state=_State())
+
+    # -- flag detection -------------------------------------------------
+    def _emit_flags(self, data: bytes, item, prov: list[str]) -> bool:
+        found = False
+        for hit in scan_flags(data, self.ctx.formats):
+            value = hit.value.decode("utf-8", "replace")
+            if hit.confirmed:
+                found = True
+                self.ctx.emit(Finding(
+                    severity="flag", handler="decode", type="flag", value=value,
+                    item_sha=item.sha256, flag=True, confidence=1.0,
+                    provenance=prov + [value],
+                ))
+        return found
+
+    def _emit_candidates(self, data: bytes, item, prov: list[str], score: float) -> None:
+        """Emit a decoded finding only for a generic flag-shaped match.
+
+        This keeps the report's lead list meaningful: a random rot/xor output is
+        not reported just for scoring high or containing stray braces. Capped
+        per item so a noisy input cannot flood findings.jsonl.
+        """
+        seen = self._cand_seen.setdefault(item.sha256, set())
+        for hit in scan_flags(data, self.ctx.formats):
+            if hit.confirmed:
+                continue  # confirmed flags are emitted by _emit_flags
+            value = hit.value.decode("utf-8", "replace")
+            if value in seen:
+                continue
+            if self._cand_counts.get(item.sha256, 0) >= MAX_CANDIDATES_PER_ITEM:
+                return
+            seen.add(value)
+            self._cand_counts[item.sha256] = self._cand_counts.get(item.sha256, 0) + 1
+            self.ctx.emit(Finding(
+                severity="info", handler="decode", type="flag_candidate", value=value,
+                item_sha=item.sha256, confidence=round(min(score, 0.5), 3),
+                provenance=prov + [value],
+            ))
+
+    # -- recursion ------------------------------------------------------
+    def _blob(self, blob: bytes, item, prov: list[str], depth: int, state: _State) -> None:
+        """Recursion target for a decoded output: structural codecs + tokens."""
+        if state.ops >= PER_CALL_OPS or depth > self.max_depth:
+            return
+        key = (depth, hash(blob))
+        if key in state.visited:
+            return
+        state.visited.add(key)
+
+        # A flag may already be visible in this blob (after a prior decode).
+        if self._emit_flags(blob, item, prov):
+            return
+
+        self._structural(blob, item, prov, depth, state)
+        for token in detect.extract_tokens(blob):
+            if state.ops >= PER_CALL_OPS:
+                return
+            self._token(token, item, prov, depth, state)
+
+    def _structural(self, blob: bytes, item, prov: list[str], depth: int, state: _State) -> None:
+        """Whole-blob codecs that need delimiters/structure."""
+        for name in detect.blob_codecs(blob):
+            state.ops += 1
+            fn = codecs.REDUCING.get(name)
+            out = fn(blob) if fn else None
+            if out:
+                self._result(out, name, True, blob, item, prov, depth, state)
+
+    def _token(self, token: bytes, item, prov: list[str], depth: int, state: _State) -> None:
+        # Reducing codecs applicable to this token's charset.
+        for name in detect.token_codecs(token):
+            state.ops += 1
+            out = codecs.REDUCING[name](token)
+            if out:
+                self._result(out, name, True, token, item, prov, depth, state)
+
+        # Conditional transforms, gated hard (they preserve length/charset).
+        if depth + 1 > self.max_depth:
+            return
+        for variant in classic.conditional_variants(token, xor_max_len=XOR_MAX_LEN):
+            state.ops += 1
+            if state.ops >= PER_CALL_OPS:
+                return
+            self._result(variant.data, variant.label, False, token, item, prov, depth, state)
+
+    def _result(self, decoded: bytes, name: str, reducing: bool, src: bytes,
+                item, prov: list[str], depth: int, state: _State) -> None:
+        if not decoded or decoded == src:
+            return
+        new_prov = prov + [name]
+
+        # Terminal: a confirmed flag in the decoded output.
+        if self._emit_flags(decoded, item, new_prov):
+            return
+
+        # A near-constant blob cannot contain a flag; never recurse into it.
+        if _too_dull(decoded):
+            return
+
+        score = score_text(decoded, self._prefix_str())
+        self._emit_candidates(decoded, item, new_prov, score)
+
+        if depth + 1 > self.max_depth:
+            return
+
+        if reducing:
+            if score >= self.threshold:
+                self._blob(decoded, item, new_prov, depth + 1, state)
+        else:
+            if self._conditional_recurse(decoded, src):
+                self._blob(decoded, item, new_prov, depth + 1, state)
+
+    def _conditional_recurse(self, decoded: bytes, src: bytes) -> bool:
+        if any(p in decoded for p in self._prefixes):
+            return True
+        if detect.classes(decoded) - detect.classes(src):
+            return True
+        if english_score(decoded) >= english_score(src) + ENGLISH_MARGIN:
+            return True
+        return False
+
+    def _prefix_str(self) -> str:
+        return self._prefixes[0].decode("latin-1") if self._prefixes else ""

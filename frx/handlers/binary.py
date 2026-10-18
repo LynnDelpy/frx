@@ -40,9 +40,10 @@ def _emit_flag_hits(ctx: Context, item: Item, data: bytes, via: str, command: st
             ))
 
 
-def _decode_needle_windows(ctx: Context, item: Item, data: bytes, via: str) -> None:
+def _feed_decoder(ctx: Context, item: Item, data: bytes, via: str) -> None:
     if ctx.decoder is None:
         return
+    # Targeted: a decode window around each needle hit, with precise provenance.
     seen_windows: set[bytes] = set()
     for nh in scan_needles(data, ctx.needles):
         if nh.window in seen_windows:
@@ -51,6 +52,10 @@ def _decode_needle_windows(ctx: Context, item: Item, data: bytes, via: str) -> N
         ctx.decoder.decode_candidate(
             nh.window, item, base_provenance=item.provenance + [f"{via}:needle={nh.label}@{nh.offset}"],
         )
+    # Comprehensive (full mode): hand the whole buffer to the decoder so long
+    # high-purity runs (nested encodings no single needle matches) are tried.
+    if ctx.mode == "full":
+        ctx.decoder.decode_candidate(data, item, base_provenance=item.provenance + [via])
 
 
 def handle(item: Item, ctx: Context) -> None:
@@ -71,7 +76,7 @@ def handle(item: Item, ctx: Context) -> None:
             data = b""
         if data:
             _emit_flag_hits(ctx, item, data, "raw", None, offset_known=True)
-            _decode_needle_windows(ctx, item, data, "raw")
+            _feed_decoder(ctx, item, data, "raw")
 
     # Three strings passes, scanned for flags and needles.
     for label, extra in STRINGS_PASSES:
@@ -81,4 +86,4 @@ def handle(item: Item, ctx: Context) -> None:
         data = res.stdout[:MAX_STRINGS_BYTES]
         via = f"strings:{label}"
         _emit_flag_hits(ctx, item, data, via, res.command, offset_known=False)
-        _decode_needle_windows(ctx, item, data, via)
+        _feed_decoder(ctx, item, data, via)
