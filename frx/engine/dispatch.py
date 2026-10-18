@@ -16,6 +16,8 @@ ROUTING: dict[str, list[str]] = {
     "iso": ["archive"],
     "disk_image": ["disk"],
     "pcap": ["pcap"],
+    "image": ["image"],
+    "document": ["document"],
 }
 UNIVERSAL = ["binary"]
 

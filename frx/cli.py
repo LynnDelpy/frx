@@ -55,6 +55,8 @@ def cmd_run(args) -> int:
         cfg.max_extracted_size = parse_size(args.max_extracted_size)
     if args.max_runtime:
         parse_duration(args.max_runtime)  # validated; budget enforced later
+    if args.wordlist:
+        cfg.wordlist = args.wordlist
 
     formats = build_formats(
         flag_formats=args.flag_format or cfg.flag_formats,
@@ -128,6 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--flag-format", action="append", help="e.g. 'CTF{...}' (repeatable)")
     r.add_argument("--flag-regex", action="append", help="raw regex (repeatable)")
     r.add_argument("--kind", help="force input kind (memory, pcap, disk, ...)")
+    r.add_argument("--wordlist", help="wordlist for archive/stego brute force")
     r.add_argument("--case", help="case dir (default cases/<timestamp>)")
     r.add_argument("--max-runtime", help="soft budget, e.g. 40m")
     r.add_argument("--max-depth", type=int)
