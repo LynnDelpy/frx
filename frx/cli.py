@@ -72,7 +72,8 @@ def cmd_run(args) -> int:
         queue = WorkQueue(cfg.max_depth, cfg.max_files, cfg.max_extracted_size)
         ctx = Context(
             runner=runner, findings=findings, queue=queue, formats=formats,
-            needles=needles, case_dir=case_dir, mode=args.mode, logfn=runlog.line,
+            needles=needles, case_dir=case_dir, mode=args.mode, wordlist=cfg.wordlist,
+            logfn=runlog.line,
         )
         _wire_decoder(ctx)
         engine = Engine(ctx)

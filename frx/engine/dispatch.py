@@ -12,7 +12,9 @@ import importlib
 
 # kind -> specialist handler module names (binary is appended to all).
 ROUTING: dict[str, list[str]] = {
-    # populated as handlers land: "pcap": ["pcap"], "disk_image": ["disk"], ...
+    "archive": ["archive"],
+    "iso": ["archive"],
+    "disk_image": ["disk"],
 }
 UNIVERSAL = ["binary"]
 
