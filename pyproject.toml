@@ -21,3 +21,4 @@ packages = ["frx"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = ["slow: end-to-end fixtures"]

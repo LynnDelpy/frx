@@ -1,0 +1,9 @@
+CTF{nested_pipeline_works}
+CTF{utf16_wide_string}
+CTF{deep_in_the_archive}
+CTF{exif_comment_flag}
+CTF{stegseek_cracked_it}
+CTF{recovered_from_slack}
+CTF{iso_contents_read}
+CTF{http_object_export}
+CTF{dns_exfil_reassembled}
