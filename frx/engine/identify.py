@@ -8,8 +8,11 @@ covers the rest. 'other' is the universal fallback so nothing is skipped.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
+
+_MEMORY_PROBE_MIN = 16 * 1024**2  # only probe sizable files as a raw memory image
 
 # Kind constants (values match the routing table / finding handler names).
 MEMORY_RAW = "memory_raw"
@@ -137,4 +140,28 @@ def identify(path, override: str | None = None, probe_memory: bool = False) -> s
     mk = _libmagic_kind(p)
     if mk:
         return mk
+    # Section-5 vol3 probe: a raw (non-LiME) memory dump has no magic libmagic
+    # knows, so a sizable otherwise-unknown input is probed with vol's banner
+    # scan (which needs no symbols). Only for top-level inputs (probe_memory),
+    # never per extracted child, so vol is not spawned thousands of times.
+    if probe_memory and _is_raw_memory(p):
+        return MEMORY_RAW
     return OTHER
+
+
+def _is_raw_memory(path: Path) -> bool:
+    try:
+        if path.stat().st_size < _MEMORY_PROBE_MIN:
+            return False
+    except OSError:
+        return False
+    if shutil.which("vol") is None:
+        return False
+    try:
+        r = subprocess.run(
+            ["vol", "-q", "-r", "jsonl", "--offline", "-f", str(path), "banners.Banners"],
+            capture_output=True, timeout=180,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return b'"Banner"' in r.stdout or b'"banner"' in r.stdout

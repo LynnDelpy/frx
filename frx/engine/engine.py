@@ -49,7 +49,9 @@ class Engine:
                 self._seed_file(p, kind_override)
 
     def _seed_file(self, p: Path, kind_override: str | None) -> None:
-        kind = identify(p, override=kind_override)
+        # probe_memory only for seeded (top-level) inputs: a raw memory dump may
+        # have no magic, but we must not run the vol probe on every child.
+        kind = identify(p, override=kind_override, probe_memory=True)
         item = self.ctx.queue.make_item(p, kind, 0, None, [p.name])
         self.ctx.queue.add(item, extracted=False)
 

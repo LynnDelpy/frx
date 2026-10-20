@@ -54,6 +54,36 @@ def test_parse_size_and_duration_reject_bad_values():
         parse_duration("abc")
 
 
+def test_identify_memory_probe_is_gated(tmp_path, monkeypatch):
+    from frx.engine import identify as idf
+
+    calls = {"n": 0}
+
+    def fake_run(argv, **kw):
+        calls["n"] += 1
+
+        class R:
+            stdout = b'{"Banner": "Linux version 7.2"}\n'
+        return R()
+
+    monkeypatch.setattr(idf.shutil, "which", lambda n: "/usr/bin/vol")
+    monkeypatch.setattr(idf.subprocess, "run", fake_run)
+
+    small = tmp_path / "s.bin"
+    small.write_bytes(b"\x00" * 100)
+    assert idf.identify(small, probe_memory=True) == idf.OTHER
+    assert calls["n"] == 0  # too small to spawn the vol probe
+
+    big = tmp_path / "b.raw"
+    big.write_bytes(b"\x00" * (17 * 1024 * 1024))
+    assert idf.identify(big, probe_memory=True) == idf.MEMORY_RAW  # banner -> raw memory
+    assert calls["n"] == 1
+
+    calls["n"] = 0
+    assert idf.identify(big, probe_memory=False) == idf.OTHER  # children never probed
+    assert calls["n"] == 0
+
+
 def test_cli_bad_size_exits_cleanly_not_traceback(tmp_path, capsys):
     from frx.cli import main
 
