@@ -96,6 +96,15 @@ def _check_wordlist(cfg: Config) -> None:
     print(f"wordlist: {'ok' if wl.is_file() else 'MISSING'} ({cfg.wordlist})")
 
 
+def _check_gpu() -> None:
+    try:
+        from .decode.gpu import probe
+        ok, detail = probe()
+    except Exception as e:  # noqa: BLE001
+        ok, detail = False, f"{type(e).__name__}: {e}"
+    print(f"gpu (--gpu, optional): {'ok, ' + detail if ok else 'not available (' + detail + ')'}")
+
+
 def run_check() -> int:
     cfg = Config.load()
     missing_required = _check_binaries()
@@ -103,6 +112,7 @@ def run_check() -> int:
     _check_sandbox()
     _check_symbols(cfg)
     _check_wordlist(cfg)
+    _check_gpu()
 
     if missing_required:
         print(f"\n{missing_required} required tool(s) missing. Run `frx setup` or install them.")

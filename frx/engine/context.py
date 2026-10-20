@@ -42,6 +42,7 @@ class Context:
     ui: Any = None  # progress.ui.ProgressUI when attached to a TTY, else None
     enforce_offline: bool = True  # whether the pass runs inside the unshare -rn sandbox
     mount: bool = False  # allow a read-only loop mount as a last resort (needs --no-sandbox)
+    use_gpu: bool = False  # opt-in OpenCL XOR-brute acceleration in the decoder
 
     @property
     def extracted_dir(self) -> Path:

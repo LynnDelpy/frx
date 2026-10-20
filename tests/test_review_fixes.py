@@ -106,6 +106,68 @@ def test_parse_size_and_duration_reject_bad_values():
         parse_duration("abc")
 
 
+def test_gpu_probe_degrades_without_pyopencl():
+    # In this environment pyopencl is absent; probe must report unavailable
+    # cleanly, never raise.
+    from frx.decode.gpu import probe
+
+    ok, detail = probe()
+    assert ok in (True, False)
+    assert isinstance(detail, str) and detail
+
+
+def test_gpu_requested_but_absent_falls_back_to_cpu(tmp_path):
+    # --gpu with no OpenCL device must still run and find the flag via the CPU
+    # path, identical to a non-gpu run.
+    from frx.cli import main
+
+    inp = tmp_path / "nested.txt"
+    import base64
+    import codecs as _c
+    tok = _c.encode(base64.b64encode(b"CTF{gpu_fallback_ok}").hex(), "rot13").encode()
+    inp.write_bytes(b"A" * 200 + b"\n" + tok + b"\n" + b"B" * 200)
+    case = tmp_path / "case"
+    rc = main(["run", str(inp), "--mode", "full", "--flag-format", "CTF{...}",
+               "--case", str(case), "--gpu", "--no-sandbox", "--no-progress"])
+    assert rc == 0
+    assert "CTF{gpu_fallback_ok}" in (case / "FLAGS.txt").read_text()
+
+
+def test_decoder_consults_gpu_prefilter_with_prefixes(tmp_path):
+    # OpenCL can't run here, so inject a fake accelerator and verify the decoder
+    # batches tokens to it and passes the flag prefixes (the kernel keys on them).
+    import base64
+    import os
+
+    from frx.decode.engine import DecodeEngine
+
+    ctx = Context(
+        runner=None, findings=FindingWriter(tmp_path), queue=WorkQueue(),
+        formats=build_formats(flag_formats=["CTF{...}"]), needles=[],
+        case_dir=tmp_path, mode="full",
+    )
+    eng = DecodeEngine(ctx)
+
+    class FakeGpu:
+        ok = True
+        detail = "fake"
+
+        def __init__(self):
+            self.calls = []
+
+        def xor_prefilter(self, tokens, prefixes):
+            self.calls.append((len(tokens), list(prefixes)))
+            return [[0x2A] for _ in tokens]  # narrow every token to one key
+
+    eng._gpu = FakeGpu()
+    blob = b"\n".join(base64.b64encode(os.urandom(300)) for _ in range(1200))  # ~640 KB > threshold
+    eng.decode_candidate(blob, _It(), ["raw"])
+    ctx.findings.close()
+    assert eng._gpu.calls, "decoder should consult the GPU prefilter"
+    assert eng._gpu.calls[0][1] == eng._prefixes  # flag prefixes passed to the kernel
+    assert eng._gpu_keys is None  # reset after the item
+
+
 def test_identify_memory_probe_is_gated(tmp_path, monkeypatch):
     from frx.engine import identify as idf
 

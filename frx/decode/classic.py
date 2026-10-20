@@ -76,14 +76,15 @@ def rotations(data: bytes) -> list[Variant]:
     return [Variant(f"rot{n}", data.translate(_ROT_TABLES[n])) for n in range(1, 26)]
 
 
-def xor_brute(data: bytes) -> list[Variant]:
-    return [Variant(f"xor:0x{key:02x}", data.translate(_XOR_TABLES[key])) for key in range(1, 256)]
+def xor_brute(data: bytes, keys=None) -> list[Variant]:
+    ks = range(1, 256) if keys is None else keys
+    return [Variant(f"xor:0x{key:02x}", data.translate(_XOR_TABLES[key])) for key in ks]
 
 
 COND_MAX_LEN = 8192  # a Caesar/XOR-wrapped flag is short; skip these on long runs
 
 
-def conditional_variants(data: bytes, xor_max_len: int = 2048) -> list[Variant]:
+def conditional_variants(data: bytes, xor_max_len: int = 2048, xor_keys=None) -> list[Variant]:
     """All charset-preserving / conditional transform outputs for a token.
 
     A flag defeated by only a rotation or single-byte XOR is short, so these
@@ -100,5 +101,5 @@ def conditional_variants(data: bytes, xor_max_len: int = 2048) -> list[Variant]:
     variants.append(Variant("atbash", atbash(data)))
     variants.append(Variant("reversed", data[::-1]))
     if len(data) <= xor_max_len:
-        variants.extend(xor_brute(data))
+        variants.extend(xor_brute(data, keys=xor_keys))
     return variants

@@ -36,6 +36,7 @@ XOR_MAX_LEN = 2048  # single-byte XOR brute only on short tokens
 # the comprehensive net, so a multi-megabyte wall of base64 noise cannot turn the
 # decoder into the slowest part of a pass. The truncation is logged, not silent.
 MAX_TOKENS_PER_ITEM = 1500
+GPU_MIN_BYTES = 256 * 1024  # only batch to the GPU when there is enough to amortize
 
 
 def _too_dull(data: bytes) -> bool:
@@ -61,6 +62,20 @@ class DecodeEngine:
         self._tok_capped: set = set()
         self._ops: dict[str, int] = {}
         self._ops_capped: set = set()
+        # Optional GPU XOR-brute prefilter (opt-in; CPU remains default + fallback).
+        self._gpu = None
+        self._gpu_keys = None
+        if getattr(ctx, "use_gpu", False):
+            try:
+                from .gpu import GpuAccelerator
+                acc = GpuAccelerator()
+                if acc.ok:
+                    self._gpu = acc
+                    ctx.log(f"  decode: GPU XOR acceleration active ({acc.detail})")
+                else:
+                    ctx.log(f"  decode: --gpu requested but unavailable ({acc.detail}); using CPU")
+            except Exception as e:  # noqa: BLE001
+                ctx.log(f"  decode: GPU init failed ({type(e).__name__}: {e}); using CPU")
 
     # -- public entry ---------------------------------------------------
     def decode_candidate(self, blob: bytes, item, base_provenance: list[str]) -> None:
@@ -80,22 +95,40 @@ class DecodeEngine:
         # for this item: the binary handler feeds the raw bytes, three strings
         # passes and the needle windows, which overlap heavily, so without this
         # the same token is brute-decoded several times over.
-        seen = self._tok_seen.setdefault(item.sha256, set())
-        for token in detect.extract_tokens(blob):
-            h = hash(token)
-            if h in seen:
-                continue
-            seen.add(h)
-            if self._tok_count.get(item.sha256, 0) >= MAX_TOKENS_PER_ITEM:
-                if item.sha256 not in self._tok_capped:
-                    self._tok_capped.add(item.sha256)
-                    self.ctx.log(
-                        f"  decode: token budget ({MAX_TOKENS_PER_ITEM}) reached for {item.short}; "
-                        "further high-purity runs not brute-decoded (needle windows still covered)"
-                    )
-                break
-            self._tok_count[item.sha256] = self._tok_count.get(item.sha256, 0) + 1
-            self._token(token, item, base_provenance, depth=0, state=_State())
+        tokens = detect.extract_tokens(blob)
+        self._gpu_prefilter(tokens)
+        try:
+            seen = self._tok_seen.setdefault(item.sha256, set())
+            for token in tokens:
+                h = hash(token)
+                if h in seen:
+                    continue
+                seen.add(h)
+                if self._tok_count.get(item.sha256, 0) >= MAX_TOKENS_PER_ITEM:
+                    if item.sha256 not in self._tok_capped:
+                        self._tok_capped.add(item.sha256)
+                        self.ctx.log(
+                            f"  decode: token budget ({MAX_TOKENS_PER_ITEM}) reached for {item.short}; "
+                            "further high-purity runs not brute-decoded (needle windows still covered)"
+                        )
+                    break
+                self._tok_count[item.sha256] = self._tok_count.get(item.sha256, 0) + 1
+                self._token(token, item, base_provenance, depth=0, state=_State())
+        finally:
+            self._gpu_keys = None
+
+    def _gpu_prefilter(self, tokens: list[bytes]) -> None:
+        """Batch the top-level tokens' XOR keys through the GPU, if enabled and
+        there is enough data to amortize the transfer. On any miss, stays None
+        and the CPU tries all 255 keys as usual."""
+        self._gpu_keys = None
+        if self._gpu is None or not tokens:
+            return
+        if sum(len(t) for t in tokens) < GPU_MIN_BYTES:
+            return
+        keys = self._gpu.xor_prefilter(tokens, self._prefixes)
+        if keys is not None:
+            self._gpu_keys = {hash(t): ks for t, ks in zip(tokens, keys)}
 
     # -- flag detection -------------------------------------------------
     @staticmethod
@@ -213,7 +246,8 @@ class DecodeEngine:
         # Conditional transforms, gated hard (they preserve length/charset).
         if depth + 1 > self.max_depth:
             return
-        for variant in classic.conditional_variants(token, xor_max_len=XOR_MAX_LEN):
+        xor_keys = self._gpu_keys.get(hash(token)) if self._gpu_keys is not None else None
+        for variant in classic.conditional_variants(token, xor_max_len=XOR_MAX_LEN, xor_keys=xor_keys):
             state.ops += 1
             if state.ops >= PER_CALL_OPS:
                 return

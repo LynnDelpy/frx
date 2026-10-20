@@ -38,6 +38,13 @@ mac     = "https://downloads.volatilityfoundation.org/volatility3/symbols/mac.zi
 [wordlists]      # only fetched with `setup --with-wordlists`
 rockyou = "https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt"
 
+[gpu]            # optional: `frx run --gpu` accelerates the decoder's XOR brute
+# Needs an OpenCL runtime for your GPU plus the Python bindings:
+#   AMD:   pacman -S --needed opencl-mesa   (or rocm-opencl-runtime)
+#   Intel: pacman -S --needed intel-compute-runtime
+# then: pipx inject volatility3 pyopencl numpy   (or pip install pyopencl numpy)
+pkgs = ["pyopencl", "numpy"]
+
 [tools]
 # Unpackaged helpers installed into ~/.local/share/frx/tools (A8/A14).
 # dwarf2json: GitHub release binary (no Go build needed).

@@ -185,6 +185,7 @@ def cmd_run(args) -> int:
             vol_plugin_timeout=cfg.vol_plugin_timeout, logfn=runlog.line,
             jobs=cfg.jobs, budget=budget, ui=ui,
             enforce_offline=args.enforce_offline, mount=args.mount,
+            use_gpu=args.use_gpu,
         )
         _wire_decoder(ctx)
         engine = Engine(ctx)
@@ -288,6 +289,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="never mount; use TSK/7z only (default)")
     r.add_argument("--no-progress", dest="no_progress", action="store_true",
                    help="suppress the live display (log heartbeat only)")
+    r.add_argument("--gpu", dest="use_gpu", action="store_true", default=False,
+                   help="experimental: OpenCL-accelerate the decoder's XOR brute "
+                        "(AMD/Intel via pyopencl; falls back to CPU if unavailable)")
     r.set_defaults(func=cmd_run)
 
     c = sub.add_parser("check", help="verify dependencies")
