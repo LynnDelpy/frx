@@ -80,13 +80,20 @@ def xor_brute(data: bytes) -> list[Variant]:
     return [Variant(f"xor:0x{key:02x}", data.translate(_XOR_TABLES[key])) for key in range(1, 256)]
 
 
+COND_MAX_LEN = 8192  # a Caesar/XOR-wrapped flag is short; skip these on long runs
+
+
 def conditional_variants(data: bytes, xor_max_len: int = 2048) -> list[Variant]:
     """All charset-preserving / conditional transform outputs for a token.
 
-    Single-byte XOR brute is skipped for long tokens: a flag defeated by only a
-    one-byte XOR is short, and brute-forcing 255 keys over a long high-entropy
-    run is pure cost (amendment A3 keeps XOR, this just bounds it).
+    A flag defeated by only a rotation or single-byte XOR is short, so these
+    length-preserving transforms are skipped entirely above COND_MAX_LEN (each
+    one copies the whole token, and brute-forcing them over a long high-entropy
+    run is pure cost). XOR brute is bounded tighter still (amendment A3 keeps the
+    transforms; this only bounds them).
     """
+    if len(data) > COND_MAX_LEN:
+        return []
     variants: list[Variant] = []
     variants.extend(rotations(data))
     variants.append(Variant("rot47", rot47(data)))

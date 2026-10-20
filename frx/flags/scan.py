@@ -14,6 +14,8 @@ from .formats import FlagFormat
 from .needles import Needle
 
 WINDOW = 4096  # bytes kept around a needle hit for the decoder
+MAX_NEEDLE_HITS = 4000  # total windows kept, so a needle that matches millions
+MAX_NEEDLE_WINDOW_BYTES = 64 * 1024**2  # of times cannot exhaust memory
 
 
 @dataclasses.dataclass(frozen=True)
@@ -52,12 +54,16 @@ def scan_flags(data: bytes, formats: list[FlagFormat]) -> list[FlagHit]:
 
 
 def scan_needles(data: bytes, needles: list[Needle], window: int = WINDOW) -> list[NeedleHit]:
-    """Locate every needle occurrence and capture a window around each.
+    """Locate needle occurrences and capture a window around each.
 
     Windows let the decoder re-examine a localized region instead of the whole
-    item. Overlapping windows for nearby hits are expected and harmless.
+    item. Overlapping windows for nearby hits are expected and harmless. The
+    total number of windows and their combined size are capped: a short needle
+    that matches millions of times would otherwise allocate windows without
+    bound and exhaust memory.
     """
     hits: list[NeedleHit] = []
+    budget = MAX_NEEDLE_WINDOW_BYTES
     for n in needles:
         start = 0
         while True:
@@ -66,6 +72,10 @@ def scan_needles(data: bytes, needles: list[Needle], window: int = WINDOW) -> li
                 break
             lo = max(0, idx - window // 2)
             hi = min(len(data), idx + len(n.value) + window // 2)
-            hits.append(NeedleHit(n.label, idx, n.value, data[lo:hi]))
+            win = data[lo:hi]
+            hits.append(NeedleHit(n.label, idx, n.value, win))
+            budget -= len(win)
+            if len(hits) >= MAX_NEEDLE_HITS or budget <= 0:
+                return hits
             start = idx + 1
     return hits

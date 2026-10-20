@@ -120,6 +120,16 @@ def cmd_run(args) -> int:
     flag_regexes = args.flag_regex or meta.get("flag_regexes") or cfg.flag_regexes
     if resuming and not args.wordlist and meta.get("wordlist"):
         cfg.wordlist = meta["wordlist"]
+    # Restore the original run's caps on resume (the journal holds only counters,
+    # not the limits), unless the resume command overrides them explicitly.
+    if resuming:
+        lim = meta.get("limits", {})
+        if args.max_depth is None and "max_depth" in lim:
+            cfg.max_depth = int(lim["max_depth"])
+        if args.max_files is None and "max_files" in lim:
+            cfg.max_files = int(lim["max_files"])
+        if not args.max_extracted_size and "max_extracted_size" in lim:
+            cfg.max_extracted_size = int(lim["max_extracted_size"])
 
     formats = build_formats(flag_formats=flag_formats, flag_regexes=flag_regexes)
     needles = _collect_needles(formats)
@@ -129,6 +139,10 @@ def cmd_run(args) -> int:
             meta_path.write_text(json.dumps({
                 "mode": mode, "flag_formats": flag_formats, "flag_regexes": flag_regexes,
                 "wordlist": cfg.wordlist, "kind": args.kind,
+                "limits": {
+                    "max_depth": cfg.max_depth, "max_files": cfg.max_files,
+                    "max_extracted_size": cfg.max_extracted_size,
+                },
             }, ensure_ascii=False), encoding="utf-8")
         except OSError:
             pass

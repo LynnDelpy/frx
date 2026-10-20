@@ -8,6 +8,8 @@ blobs are handed to the decode engine when one is wired into the context.
 
 from __future__ import annotations
 
+import shutil
+
 from ..flags.scan import scan_flags, scan_needles
 from ..engine.context import Context
 from ..engine.queue import Item
@@ -19,6 +21,7 @@ STRINGS_PASSES = (
     ("utf-16be", ["-a", "-e", "b"]),
 )
 MAX_STRINGS_BYTES = 256 * 1024**2  # cap captured strings output
+MIN_CARVE_SIZE = 64  # nothing to carve out of a handful of bytes
 
 
 def _emit_flag_hits(ctx: Context, item: Item, data: bytes, via: str, command: str | None, offset_known: bool) -> None:
@@ -58,6 +61,71 @@ def _feed_decoder(ctx: Context, item: Item, data: bytes, via: str) -> None:
         ctx.decoder.decode_candidate(data, item, base_provenance=item.provenance + [via])
 
 
+def _enqueue_carved(ctx: Context, item: Item, root, tool: str) -> int:
+    if not root.is_dir():
+        return 0
+    n = 0
+    for child in sorted(root.rglob("*")):
+        if child.is_file() and not child.is_symlink() and child.stat().st_size:
+            rel = child.relative_to(root)
+            if ctx.enqueue_file(child, item, f"binary:{tool}:{rel}"):
+                n += 1
+    if n:
+        ctx.log(f"  binary {item.short}: {tool} carved {n} file(s)")
+    return n
+
+
+def _bulk_extractor_features(ctx: Context, item: Item, root) -> None:
+    """Scan bulk_extractor feature files for flags and feed base64 to the decoder."""
+    if not root.is_dir():
+        return
+    for feat in sorted(root.glob("*.txt")):
+        try:
+            data = feat.read_bytes()
+        except OSError:
+            continue
+        if not data.strip():
+            continue
+        for hit in scan_flags(data, ctx.formats):
+            if hit.confirmed:
+                v = hit.value.decode("utf-8", "replace")
+                ctx.emit(Finding(
+                    severity="flag", handler="binary", type="flag", value=v, item_sha=item.sha256,
+                    flag=True, confidence=1.0,
+                    provenance=item.provenance + [f"binary:bulk_extractor:{feat.name}", v],
+                ))
+        if ctx.decoder is not None and feat.name.startswith("base64"):
+            ctx.decoder.decode_candidate(data, item, item.provenance + [f"binary:bulk_extractor:{feat.name}"])
+
+
+def _carve(item: Item, ctx: Context) -> None:
+    """Full-mode carving (spec section 6.7, amendment A1): binwalk extraction,
+    foremost, and (optional) bulk_extractor. Carved files are enqueued as
+    children, so the queue's depth/file/size caps bound the recursion."""
+    if item.size < MIN_CARVE_SIZE:
+        return
+    carve = ctx.child_dir(item) / "carve"
+    carve.mkdir(parents=True, exist_ok=True)
+    if shutil.which("binwalk"):
+        bdir = carve / "binwalk"
+        bdir.mkdir(parents=True, exist_ok=True)
+        # -e -C <dir> is the extraction form on both binwalk 2.x and the 3.x
+        # Rust rewrite (which dropped --dd); we parse the carved tree, not a log.
+        ctx.runner.run(["binwalk", "-e", "-C", str(bdir), str(item.path)],
+                       timeout=ctx.runner.default_timeout)
+        _enqueue_carved(ctx, item, bdir, "binwalk")
+    if shutil.which("foremost"):
+        fdir = carve / "foremost"  # foremost creates this; do not pre-make it
+        ctx.runner.run(["foremost", "-t", "all", "-o", str(fdir), str(item.path)],
+                       timeout=ctx.runner.default_timeout)
+        _enqueue_carved(ctx, item, fdir, "foremost")
+    if shutil.which("bulk_extractor"):  # optional (amendment A8)
+        edir = carve / "bulk_extractor"
+        ctx.runner.run(["bulk_extractor", "-o", str(edir), str(item.path)],
+                       timeout=ctx.runner.default_timeout)
+        _bulk_extractor_features(ctx, item, edir)
+
+
 def handle(item: Item, ctx: Context) -> None:
     # file(1) description as an artifact.
     res = ctx.runner.run(["file", "-b", str(item.path)], timeout=60)
@@ -87,3 +155,7 @@ def handle(item: Item, ctx: Context) -> None:
         via = f"strings:{label}"
         _emit_flag_hits(ctx, item, data, via, res.command, offset_known=False)
         _feed_decoder(ctx, item, data, via)
+
+    # Carving + feature extraction (full mode only).
+    if ctx.mode == "full":
+        _carve(item, ctx)

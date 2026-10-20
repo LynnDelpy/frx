@@ -29,6 +29,7 @@ from .identify import identify
 class Engine:
     def __init__(self, ctx: Context):
         self.ctx = ctx
+        self._aborting = False  # set on a hard abort so in-flight items are not marked done
 
     # -- seeding --------------------------------------------------------
     def seed(self, inputs: list[str], kind_override: str | None = None) -> None:
@@ -101,6 +102,7 @@ class Engine:
                         self.ctx.log(f"worker crashed: {type(exc).__name__}: {exc}")
         except KeyboardInterrupt:
             hard_abort = True
+            self._aborting = True  # in-flight items are interrupted, not done
             self.ctx.log("hard abort (second interrupt): killing in-flight tools")
         finally:
             if not hard_abort and inflight:
@@ -111,6 +113,7 @@ class Engine:
                     wait(inflight)
                 except KeyboardInterrupt:
                     hard_abort = True
+                    self._aborting = True
                     self.ctx.log("hard abort during drain: killing in-flight tools")
             if hard_abort:
                 killer = getattr(self.ctx.runner, "kill_all", None)
@@ -123,10 +126,17 @@ class Engine:
             self.ctx.budget.stop("signal")
 
     def _process(self, item) -> None:
-        """Run every handler for one item, isolating failures, then mark done."""
+        """Run every handler for one item, isolating failures, then mark done.
+
+        The item is marked done (so --resume skips it) only when all handlers
+        actually ran: a KeyboardInterrupt mid-handler (sequential hard abort)
+        leaves `completed` False, and a parallel hard abort sets `_aborting`, so
+        in either case an interrupted item is re-processed on resume, not lost.
+        """
         ui = getattr(self.ctx, "ui", None)
         if ui is not None:
             ui.item_start(item)
+        completed = False
         try:
             self.ctx.log(f"item {item.short} kind={item.kind} depth={item.depth}")
             for name, handle in handlers_for(item.kind):
@@ -139,8 +149,10 @@ class Engine:
                         item_sha=item.sha256, provenance=item.provenance + [f"{name}:error"],
                     ))
                     self.ctx.log(f"  handler {name} error on {item.short}: {e}")
+            completed = True
         finally:
-            self.ctx.queue.mark_done(item)
+            if completed and not self._aborting:
+                self.ctx.queue.mark_done(item)
             if ui is not None:
                 ui.item_end()
 

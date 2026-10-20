@@ -14,7 +14,7 @@ import codecs as _py_codecs
 import re
 import urllib.parse
 
-_WS = b" \t\r\n"
+_WS = b" \t\r\n\v\f"
 
 _MORSE = {
     ".-": "a", "-...": "b", "-.-.": "c", "-..": "d", ".": "e", "..-.": "f",
@@ -29,7 +29,7 @@ _B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
 def _strip_ws(data: bytes) -> bytes:
-    return bytes(b for b in data if b not in _WS)
+    return data.translate(None, _WS)  # C-speed; runs once per token per codec
 
 
 def decode_hex(data: bytes) -> bytes | None:

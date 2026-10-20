@@ -39,11 +39,16 @@ def classes(token: bytes) -> set[str]:
     body = s.rstrip(b"=")
     if len(s) >= 4 and len(s) % 2 == 0 and _HEX.match(s):
         out.add("hex")
-    if len(body) >= 8 and len(s) % 4 == 0 and _B64.match(s):
+    # Accept UNPADDED base64/base32 too: the decoders re-pad, and CTF flags are
+    # very often stripped of '='. Only lengths that are impossible for the codec
+    # are rejected (len%4==1 for base64; len%8 in {1,3,6} for base32).
+    if len(body) >= 8 and len(s) % 4 != 1 and _B64.match(s):
         out.add("base64")
-    if len(body) >= 8 and len(s) % 8 == 0 and _B32.match(s):
+    if len(body) >= 8 and (len(s) % 8) not in (1, 3, 6) and _B32.match(s):
         out.add("base32")
-    if len(s) >= 4 and _B58.match(s):
+    # base58 decode is O(n^2) (bignum), so only class short runs: a base58-wrapped
+    # flag is short, and this stops a long run from being decoded quadratically.
+    if 4 <= len(s) <= 512 and _B58.match(s):
         out.add("base58")
     if len(s) >= 8 and len(s) % 8 == 0 and _BIN.match(s):
         out.add("binary")
