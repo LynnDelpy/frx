@@ -18,27 +18,34 @@ _ENGLISH = {
 }
 _PRINTABLE = set(range(0x20, 0x7F)) | {0x09, 0x0A, 0x0D}
 
+# C-speed helpers: the decoder scores every candidate variant, so these run
+# hundreds of thousands of times. Both avoid per-byte Python loops.
+# _PRINTABLE_BYTES: deleting these from a buffer leaves only the non-printable
+# bytes, whose count gives the printable ratio by subtraction.
+_PRINTABLE_BYTES = bytes(sorted(_PRINTABLE))
+# _KEEP_LETTERS lowercases A-Z and marks every non-letter for deletion, so one
+# translate() yields just the lowercase letters to count per English frequency.
+_DELETE_NON_LETTERS = bytes(b for b in range(256) if not (65 <= b <= 90 or 97 <= b <= 122))
+_LOWER = bytes((b + 32) if 65 <= b <= 90 else b for b in range(256))
+
 
 def printable_ratio(data: bytes) -> float:
     if not data:
         return 0.0
-    good = sum(1 for b in data if b in _PRINTABLE)
-    return good / len(data)
+    nonprintable = len(data.translate(None, _PRINTABLE_BYTES))
+    return (len(data) - nonprintable) / len(data)
 
 
 def english_score(data: bytes) -> float:
     """Normalized chi-square fit to English letter frequencies, 0..1."""
-    letters = [chr(b).lower() for b in data if 65 <= b <= 90 or 97 <= b <= 122]
+    letters = data.translate(_LOWER, _DELETE_NON_LETTERS)  # lowercase a-z only
     n = len(letters)
     if n < 4:
         return 0.0
-    counts: dict[str, int] = {}
-    for c in letters:
-        counts[c] = counts.get(c, 0) + 1
     chi2 = 0.0
     for c, pct in _ENGLISH.items():
         expected = pct / 100.0 * n
-        observed = counts.get(c, 0)
+        observed = letters.count(c.encode())
         if expected > 0:
             chi2 += (observed - expected) ** 2 / expected
     # Map chi2 (0=perfect) to (0..1]; divide by n to make it length-independent.

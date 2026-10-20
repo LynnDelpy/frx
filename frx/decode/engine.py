@@ -26,9 +26,16 @@ MAX_DEPTH = 5
 THRESHOLD = 0.5
 PER_CALL_OPS = 8000
 ENGLISH_MARGIN = 0.15
+ENGLISH_FLOOR = 0.40  # a conditional transform recurses on English only above this
 MAX_CANDIDATES_PER_ITEM = 50
+MAX_OPS_PER_ITEM = 400_000  # hard ceiling on decode attempts per item (backstop)
 MIN_DIVERSITY = 4  # a blob with fewer distinct bytes cannot hold a flag
 XOR_MAX_LEN = 2048  # single-byte XOR brute only on short tokens
+# Total high-purity tokens brute-decoded per item across every whole-blob pass.
+# The targeted needle-window decodes are cheap and always run; this only bounds
+# the comprehensive net, so a multi-megabyte wall of base64 noise cannot turn the
+# decoder into the slowest part of a pass. The truncation is logged, not silent.
+MAX_TOKENS_PER_ITEM = 1500
 
 
 def _too_dull(data: bytes) -> bool:
@@ -49,6 +56,11 @@ class DecodeEngine:
         self._prefixes = [f.prefix.encode() for f in ctx.formats if f.prefix]
         self._cand_counts: dict[str, int] = {}
         self._cand_seen: dict[str, set] = {}
+        self._tok_seen: dict[str, set] = {}
+        self._tok_count: dict[str, int] = {}
+        self._tok_capped: set = set()
+        self._ops: dict[str, int] = {}
+        self._ops_capped: set = set()
 
     # -- public entry ---------------------------------------------------
     def decode_candidate(self, blob: bytes, item, base_provenance: list[str]) -> None:
@@ -64,23 +76,63 @@ class DecodeEngine:
         self._emit_flags(blob, item, base_provenance)
         # Whole-blob structural codecs (url/quopri/utf16/morse/decimal/binary).
         self._structural(blob, item, base_provenance, depth=0, state=_State())
-        # Each high-purity run with a fresh budget.
+        # Each high-purity run with a fresh budget, skipping tokens already tried
+        # for this item: the binary handler feeds the raw bytes, three strings
+        # passes and the needle windows, which overlap heavily, so without this
+        # the same token is brute-decoded several times over.
+        seen = self._tok_seen.setdefault(item.sha256, set())
         for token in detect.extract_tokens(blob):
+            h = hash(token)
+            if h in seen:
+                continue
+            seen.add(h)
+            if self._tok_count.get(item.sha256, 0) >= MAX_TOKENS_PER_ITEM:
+                if item.sha256 not in self._tok_capped:
+                    self._tok_capped.add(item.sha256)
+                    self.ctx.log(
+                        f"  decode: token budget ({MAX_TOKENS_PER_ITEM}) reached for {item.short}; "
+                        "further high-purity runs not brute-decoded (needle windows still covered)"
+                    )
+                break
+            self._tok_count[item.sha256] = self._tok_count.get(item.sha256, 0) + 1
             self._token(token, item, base_provenance, depth=0, state=_State())
 
     # -- flag detection -------------------------------------------------
+    @staticmethod
+    def _is_brute(step: str) -> bool:
+        # Single-byte XOR brute tries 255 keys per token, so over high-entropy
+        # data it coincidentally spells flag-shaped matches ("CTF{EMgV}"). A
+        # format match reachable only this way is a lead, not a confirmation.
+        return step.startswith("xor:")
+
     def _emit_flags(self, data: bytes, item, prov: list[str]) -> bool:
-        found = False
+        brute = bool(prov) and self._is_brute(prov[-1])
+        confirmed_found = False
         for hit in scan_flags(data, self.ctx.formats):
+            if not hit.confirmed:
+                continue
             value = hit.value.decode("utf-8", "replace")
-            if hit.confirmed:
-                found = True
-                self.ctx.emit(Finding(
-                    severity="flag", handler="decode", type="flag", value=value,
-                    item_sha=item.sha256, flag=True, confidence=1.0,
-                    provenance=prov + [value],
-                ))
-        return found
+            if brute:
+                self._emit_brute_candidate(value, item, prov)
+                continue
+            confirmed_found = True
+            self.ctx.emit(Finding(
+                severity="flag", handler="decode", type="flag", value=value,
+                item_sha=item.sha256, flag=True, confidence=1.0,
+                provenance=prov + [value],
+            ))
+        return confirmed_found
+
+    def _emit_brute_candidate(self, value: str, item, prov: list[str]) -> None:
+        seen = self._cand_seen.setdefault(item.sha256, set())
+        if value in seen or self._cand_counts.get(item.sha256, 0) >= MAX_CANDIDATES_PER_ITEM:
+            return
+        seen.add(value)
+        self._cand_counts[item.sha256] = self._cand_counts.get(item.sha256, 0) + 1
+        self.ctx.emit(Finding(
+            severity="info", handler="decode", type="flag_candidate", value=value,
+            item_sha=item.sha256, confidence=0.3, provenance=prov + [value],
+        ))
 
     def _emit_candidates(self, data: bytes, item, prov: list[str], score: float) -> None:
         """Emit a decoded finding only for a generic flag-shaped match.
@@ -154,6 +206,16 @@ class DecodeEngine:
 
     def _result(self, decoded: bytes, name: str, reducing: bool, src: bytes,
                 item, prov: list[str], depth: int, state: _State) -> None:
+        n = self._ops.get(item.sha256, 0)
+        if n >= MAX_OPS_PER_ITEM:
+            if item.sha256 not in self._ops_capped:
+                self._ops_capped.add(item.sha256)
+                self.ctx.log(
+                    f"  decode: op budget ({MAX_OPS_PER_ITEM}) reached for {item.short}; "
+                    "comprehensive decode truncated (needle windows still covered)"
+                )
+            return
+        self._ops[item.sha256] = n + 1
         if not decoded or decoded == src:
             return
         new_prov = prov + [name]
@@ -184,7 +246,12 @@ class DecodeEngine:
             return True
         if detect.classes(decoded) - detect.classes(src):
             return True
-        if english_score(decoded) >= english_score(src) + ENGLISH_MARGIN:
+        # English-improvement gate: require a real absolute English score, not
+        # just a relative bump. Rotations/XORs of high-entropy base64 noise jitter
+        # the score enough to clear a pure margin test, which was the main driver
+        # of runaway recursion; genuine Caesar/XOR-of-text clears the floor.
+        ds = english_score(decoded)
+        if ds >= ENGLISH_FLOOR and ds >= english_score(src) + ENGLISH_MARGIN:
             return True
         return False
 

@@ -21,8 +21,13 @@ _BIN = re.compile(rb"^[01]+$")
 _RUN = re.compile(rb"[A-Za-z0-9+/=]{%d,}")
 
 
+_WS = b" \t\r\n\v\f"
+
+
 def _strip_ws(data: bytes) -> bytes:
-    return bytes(b for b in data if b not in b" \t\r\n")
+    # C-speed whitespace strip: classes() runs this on every candidate variant
+    # the decoder considers, so a per-byte Python loop here dominated a full pass.
+    return data.translate(None, _WS)
 
 
 def classes(token: bytes) -> set[str]:
