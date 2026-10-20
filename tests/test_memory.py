@@ -67,7 +67,10 @@ def test_run_plugin_argv_is_offline_jsonl(tmp_path):
     assert a[-1] == "banners.Banners"
 
 
-def test_honest_limit_when_no_symbols(tmp_path):
+def test_honest_limit_when_no_symbols(tmp_path, monkeypatch):
+    # The FakeRunner scripts vol's output, so bypass the real PATH probe: this is
+    # a pure-logic test of the handler, independent of whether vol is installed.
+    monkeypatch.setattr(vol, "vol_available", lambda: True)
     (tmp_path / "mem.raw").write_bytes(b"EMiL" + b"\x00" * 100)
 
     def script(argv):
@@ -93,7 +96,8 @@ def test_honest_limit_when_no_symbols(tmp_path):
     assert any("7.2.9-2-cachyos" in v for v in vals)
 
 
-def test_flag_in_plugin_output_is_found(tmp_path):
+def test_flag_in_plugin_output_is_found(tmp_path, monkeypatch):
+    monkeypatch.setattr(vol, "vol_available", lambda: True)
     (tmp_path / "mem.raw").write_bytes(b"EMiL" + b"\x00" * 100)
 
     def script(argv):
