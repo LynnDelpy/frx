@@ -70,7 +70,19 @@ class FindingWriter:
         self._lock = threading.Lock()
         self._jsonl: TextIO = self._jsonl_path.open("a", encoding="utf-8")
         self._listeners: list = []
-        self._seen_flags: set[str] = set()
+        self._seen_flags: set[str] = self._load_existing_flags()
+
+    def _load_existing_flags(self) -> set[str]:
+        """Preload flags already in FLAGS.txt so a resumed run does not re-append.
+
+        FLAGS.txt lines are `value\\tprovenance`; the value is the first field.
+        """
+        seen: set[str] = set()
+        if self._flags_path.is_file():
+            for line in self._flags_path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    seen.add(line.split("\t", 1)[0])
+        return seen
 
     def add_listener(self, fn) -> None:
         self._listeners.append(fn)

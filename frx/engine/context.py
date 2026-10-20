@@ -36,6 +36,11 @@ class Context:
     max_inmem: int = 64 * 1024**2  # scan raw bytes directly below this size
     decoder: Any = None  # set by the engine once the decode engine exists
     logfn: Optional[Callable[[str], None]] = None
+    jobs: int = 1  # parallel item workers; >1 drains the queue in a thread pool
+    budget: Any = None  # engine.budget.Budget: runtime cap + SIGINT graceful stop
+    ui: Any = None  # progress.ui.ProgressUI when attached to a TTY, else None
+    enforce_offline: bool = True  # whether the pass runs inside the unshare -rn sandbox
+    mount: bool = False  # allow a read-only loop mount as a last resort (needs --no-sandbox)
 
     @property
     def extracted_dir(self) -> Path:

@@ -54,12 +54,17 @@ class Runner:
         default_timeout: float = 300.0,
         nice: bool = True,
         logfn=None,
+        observer=None,
     ):
         self.case_dir = Path(case_dir)
         self.default_timeout = default_timeout
         self.nice = nice and shutil.which("nice") is not None
         self.ionice = nice and shutil.which("ionice") is not None
         self._logfn = logfn
+        # Optional live-UI hook: observer.tool_start(argv)/tool_end(argv) are
+        # called around each spawn so the per-worker display can show the tool
+        # that is running and for how long. Never allowed to break a run.
+        self._observer = observer
         self._tmp = self.case_dir / "tmp"
         self._tmp.mkdir(parents=True, exist_ok=True)
 
@@ -93,28 +98,43 @@ class Runner:
         wrapped = self._wrap(list(argv))
         if self._logfn:
             self._logfn("exec: " + " ".join(shlex.quote(a) for a in argv))
+        self._notify("tool_start", argv)
         start = time.monotonic()
         try:
-            proc = subprocess.Popen(
-                wrapped,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
-                cwd=str(cwd) if cwd else None,
-                env=self._env(env),
-                start_new_session=True,  # own process group, for clean kill
-            )
-        except (FileNotFoundError, PermissionError) as e:
-            return RunResult(list(argv), None, b"", b"", 0.0, error=str(e))
+            try:
+                proc = subprocess.Popen(
+                    wrapped,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+                    cwd=str(cwd) if cwd else None,
+                    env=self._env(env),
+                    start_new_session=True,  # own process group, for clean kill
+                )
+            except (FileNotFoundError, PermissionError) as e:
+                return RunResult(list(argv), None, b"", b"", 0.0, error=str(e))
+            try:
+                out, err = proc.communicate(input=input_bytes, timeout=timeout)
+                dur = time.monotonic() - start
+                return RunResult(list(argv), proc.returncode, out, err, dur)
+            except subprocess.TimeoutExpired:
+                self._kill_group(proc)
+                out, err = proc.communicate()
+                dur = time.monotonic() - start
+                return RunResult(list(argv), proc.returncode, out or b"", err or b"", dur, timed_out=True)
+        finally:
+            self._notify("tool_end", argv)
+
+    def _notify(self, event: str, argv: list[str]) -> None:
+        if self._observer is None:
+            return
+        fn = getattr(self._observer, event, None)
+        if fn is None:
+            return
         try:
-            out, err = proc.communicate(input=input_bytes, timeout=timeout)
-            dur = time.monotonic() - start
-            return RunResult(list(argv), proc.returncode, out, err, dur)
-        except subprocess.TimeoutExpired:
-            self._kill_group(proc)
-            out, err = proc.communicate()
-            dur = time.monotonic() - start
-            return RunResult(list(argv), proc.returncode, out or b"", err or b"", dur, timed_out=True)
+            fn(argv)
+        except Exception:
+            pass
 
     @staticmethod
     def _kill_group(proc: subprocess.Popen) -> None:
