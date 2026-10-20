@@ -23,6 +23,7 @@ RECON_STATS = (
     ("tcp-conversations", ["-z", "conv,tcp", "-q"]),
     ("udp-conversations", ["-z", "conv,udp", "-q"]),
     ("ip-endpoints", ["-z", "endpoints,ip", "-q"]),
+    ("http-tree", ["-z", "http,tree", "-q"]),  # spec section 6.2
 )
 
 
@@ -60,15 +61,17 @@ def _dns_exfil(ctx: Context, item: Item) -> None:
     names = [n.strip() for n in res.out_text().splitlines() if n.strip()]
     if not names:
         return
-    # Group by zone (everything after the first label); concatenate first labels
-    # in capture order -> the reassembled exfil channel.
+    # Group by the registrable zone (last two labels); concatenate ALL preceding
+    # labels of each name, in capture order, as that name's data. This keeps
+    # multi-label-per-query exfil (c1.c2.c3.zone.tld) instead of only the first
+    # label, while a single-data-label query (chunk.zone.tld) still reassembles.
     zones: dict[str, list[str]] = {}
     for name in names:
         labels = name.split(".")
-        if len(labels) < 2:
+        if len(labels) < 3:
             continue
-        zone = ".".join(labels[1:])
-        zones.setdefault(zone, []).append(labels[0])
+        zone = ".".join(labels[-2:])
+        zones.setdefault(zone, []).append("".join(labels[:-2]))
     for zone, chunks in zones.items():
         reassembled = "".join(chunks).encode()
         if len(reassembled) < 4:
@@ -97,10 +100,13 @@ def _dns_exfil(ctx: Context, item: Item) -> None:
 
 def _credentials(ctx: Context, item: Item) -> None:
     res = _tshark(ctx, item, ["-z", "credentials", "-q"], timeout=120)
-    if res.stdout.strip() and "no " not in res.out_text().lower()[:40]:
+    # tshark always prints a header/separator; only a real data row (which starts
+    # with a packet number) means credentials were actually found.
+    rows = [l for l in res.out_text().splitlines() if l.split() and l.split()[0].isdigit()]
+    if rows:
         ctx.emit(Finding(
             severity="high", handler="pcap", type="artifact",
-            value=f"credentials:\n{res.out_text().strip()[:1500]}", item_sha=item.sha256,
+            value="credentials:\n" + "\n".join(rows)[:1500], item_sha=item.sha256,
             provenance=item.provenance + ["pcap:credentials"], command=res.command,
         ))
 

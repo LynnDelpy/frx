@@ -19,7 +19,8 @@ from ..engine.queue import Item
 from ..report.findings import Finding
 
 _MMLS_ROW = re.compile(r"^\s*\d+:\s+\S+\s+(\d+)\s+(\d+)\s+(\d+)\s+(.*)$")
-_SKIP_DESC = ("unallocated", "primary table", "safety table", "gpt header", "meta")
+_SKIP_DESC = ("unallocated", "primary table", "safety table", "gpt header",
+              "partition table", "meta")
 
 
 def _partitions(ctx: Context, item: Item) -> list[tuple[int, str]]:
@@ -45,7 +46,9 @@ def _offset_args(offset: int | None) -> list[str]:
 def _enqueue_tree(ctx: Context, item: Item, root: Path, label: str) -> int:
     n = 0
     for child in sorted(root.rglob("*")):
-        if child.is_file():
+        # Never follow a symlink out of the extraction dir: a crafted image can
+        # plant one pointing at /etc/passwd, and we would read/scan it.
+        if child.is_file() and not child.is_symlink():
             rel = child.relative_to(root)
             if ctx.enqueue_file(child, item, f"{label}:{rel}"):
                 n += 1
@@ -75,7 +78,10 @@ def _process_fs(ctx: Context, item: Item, offset: int | None, tag: str) -> bool:
     # Listing, flagging deleted entries for the report.
     fls = ctx.runner.run(["fls", "-r", "-p", *oa, str(item.path)], timeout=ctx.runner.default_timeout)
     for line in fls.out_text().splitlines():
-        if line.startswith("*") or "* " in line[:4]:
+        # fls marks a deleted entry with a standalone '*' after the type field,
+        # e.g. "r/r * 13-128-2:\tname"; a live entry has the inode token there.
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[1] == "*":
             ctx.emit(Finding(
                 severity="high", handler="disk", type="artifact",
                 value=f"deleted entry: {line.strip()}", item_sha=item.sha256,
@@ -139,11 +145,15 @@ def _mount_fallback(item: Item, ctx: Context) -> bool:
         for child in sorted(mp.rglob("*")):
             if not child.is_file() or child.is_symlink():
                 continue
+            if child.is_symlink():
+                continue  # don't copy a symlink target out of the mount
             try:
                 sz = child.stat().st_size
             except OSError:
                 continue
-            if copied + sz > budget:
+            # Count what the rest of the run already extracted, so the mount copy
+            # cannot blow past --max-extracted-size on its own.
+            if ctx.queue.extracted_bytes + copied + sz > budget:
                 skipped += 1
                 continue
             rel = child.relative_to(mp)

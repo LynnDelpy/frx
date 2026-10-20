@@ -16,17 +16,56 @@ from ..engine.context import Context
 from ..engine.queue import Item
 from ..report.findings import Finding
 
-MAX_CRACK_WORDS = 100000
+MAX_CRACK_WORDS = 100000  # cap for zip2john+john (fast)
+MAX_7Z_WORDS = 2000       # cap for the per-word 7z brute (slow: ~100 pw/s, A9)
 
 
 def _enqueue_tree(ctx: Context, item: Item, root: Path, label: str) -> int:
     n = 0
     for child in sorted(root.rglob("*")):
-        if child.is_file():
+        # Skip symlinks: a crafted archive can plant one pointing outside the
+        # extraction dir, and we would read/scan the target.
+        if child.is_file() and not child.is_symlink():
             rel = child.relative_to(root)
             if ctx.enqueue_file(child, item, f"{label}:{rel}"):
                 n += 1
     return n
+
+
+def _capped_wordlist(ctx: Context, item: Item, limit: int) -> Path | None:
+    """Write the first `limit` words of the configured wordlist to a case-local
+    file, so the brute force honors the attempt cap (amendment A9)."""
+    if not ctx.wordlist or not Path(ctx.wordlist).is_file():
+        return None
+    dst = ctx.case_dir / "tmp" / f"{item.short}.wl{limit}"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    n = 0
+    with Path(ctx.wordlist).open("r", encoding="utf-8", errors="ignore") as src, \
+            dst.open("w", encoding="utf-8") as out:
+        for line in src:
+            out.write(line)
+            n += 1
+            if n >= limit:
+                break
+    return dst if n else None
+
+
+def _uncompressed_size(ctx: Context, item: Item) -> int | None:
+    """Total uncompressed size from `7z l -slt`, or None if it cannot be read
+    (e.g. an encrypted header). Used to refuse a zip bomb before extracting it."""
+    res = ctx.runner.run(["7z", "l", "-slt", "-p", "-y", str(item.path)], timeout=120)
+    if res.returncode != 0:
+        return None
+    total = 0
+    found = False
+    for line in res.out_text().splitlines():
+        if line.startswith("Size = "):
+            try:
+                total += int(line[7:].strip())
+                found = True
+            except ValueError:
+                pass
+    return total if found else None
 
 
 def _try_extract(ctx: Context, item: Item, out: Path, password: str | None) -> tuple[bool, str]:
@@ -42,9 +81,10 @@ def _is_encrypted(text: str) -> bool:
 
 
 def _crack_zip(ctx: Context, item: Item) -> str | None:
-    if not ctx.wordlist or not Path(ctx.wordlist).is_file():
-        return None
     if shutil.which("zip2john") is None or shutil.which("john") is None:
+        return None
+    wordlist = _capped_wordlist(ctx, item, MAX_CRACK_WORDS)
+    if wordlist is None:
         return None
     case_tmp = ctx.case_dir / "tmp"
     hashfile = case_tmp / f"{item.short}.ziphash"
@@ -55,7 +95,7 @@ def _crack_zip(ctx: Context, item: Item) -> str | None:
     pot = case_tmp / f"{item.short}.pot"
     session = case_tmp / f"{item.short}.john"
     ctx.runner.run([
-        "john", f"--wordlist={ctx.wordlist}", f"--pot={pot}",
+        "john", f"--wordlist={wordlist}", f"--pot={pot}",
         f"--session={session}", str(hashfile),
     ], timeout=ctx.runner.default_timeout)
     show = ctx.runner.run(["john", f"--pot={pot}", "--show", str(hashfile)], timeout=60)
@@ -67,9 +107,35 @@ def _crack_zip(ctx: Context, item: Item) -> str | None:
     return None
 
 
+def _crack_7z(ctx: Context, item: Item) -> str | None:
+    """Capped per-word 7z brute for non-zip encrypted archives (amendment A9)."""
+    wordlist = _capped_wordlist(ctx, item, MAX_7Z_WORDS)
+    if wordlist is None:
+        return None
+    for word in wordlist.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if not word:
+            continue
+        res = ctx.runner.run(["7z", "t", f"-p{word}", "-y", str(item.path)], timeout=60)
+        if res.returncode == 0:
+            return word
+    return None
+
+
 def handle(item: Item, ctx: Context) -> None:
     out = ctx.child_dir(item) / f"arc_{item.short}"
     out.mkdir(parents=True, exist_ok=True)
+
+    # Zip-bomb guard: refuse before writing if the uncompressed total would blow
+    # past the remaining global extraction budget (caps also apply at enqueue).
+    budget_left = ctx.queue.max_extracted_size - ctx.queue.extracted_bytes
+    size = _uncompressed_size(ctx, item)
+    if size is not None and size > budget_left:
+        ctx.emit(Finding(
+            severity="high", handler="archive", type="artifact",
+            value=f"archive not extracted: uncompressed {size} bytes exceeds remaining budget {budget_left}",
+            item_sha=item.sha256, provenance=item.provenance + ["archive:too-large"],
+        ))
+        return
 
     ok, text = _try_extract(ctx, item, out, password=None)
     password = None
@@ -80,7 +146,7 @@ def handle(item: Item, ctx: Context) -> None:
             provenance=item.provenance + ["archive:encrypted"],
         ))
         if ctx.mode == "full":
-            password = _crack_zip(ctx, item)
+            password = _crack_zip(ctx, item) or _crack_7z(ctx, item)
             if password:
                 ctx.emit(Finding(
                     severity="high", handler="archive", type="artifact",
