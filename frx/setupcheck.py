@@ -23,7 +23,7 @@ DATA = Path(__file__).parent / "data"
 # name -> required?  (optional tools are reported but never fail `check`)
 REQUIRED_BINARIES = {
     "file": True, "strings": True, "rg": True, "7z": True, "binwalk": True,
-    "foremost": True, "exiftool": True, "tshark": True, "unzip": True,
+    "foremost": True, "exiftool": True, "tshark": True,
     "mmls": True, "fls": True, "icat": True, "tsk_recover": True, "blkls": True,
     "pdftotext": True, "pdfdetach": True, "qpdf": True, "zsteg": True,
     "steghide": True, "stegseek": True, "pngcheck": True, "jpeginfo": True,

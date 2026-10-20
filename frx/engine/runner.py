@@ -141,6 +141,63 @@ class Runner:
         finally:
             self._notify("tool_end", argv)
 
+    def run_to_file(
+        self,
+        argv: list[str],
+        out_fh,
+        timeout: float | None = None,
+        cwd: Path | None = None,
+        env: dict | None = None,
+    ) -> RunResult:
+        """Run a tool, streaming its stdout straight into `out_fh`.
+
+        For tools whose output can be huge (strings / blkls over a multi-GB
+        image), capturing stdout through a pipe would buffer it all in RAM. Here
+        the OS writes stdout directly to the file; only stderr (small) is piped,
+        so there is no large-output pipe deadlock and RAM stays bounded. The
+        returned RunResult has empty stdout (it is in the file).
+        """
+        import time
+
+        timeout = self.default_timeout if timeout is None else timeout
+        wrapped = self._wrap(list(argv))
+        if self._logfn:
+            self._logfn("exec: " + " ".join(shlex.quote(a) for a in argv))
+        self._notify("tool_start", argv)
+        start = time.monotonic()
+        try:
+            try:
+                proc = subprocess.Popen(
+                    wrapped,
+                    stdout=out_fh,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.DEVNULL,
+                    cwd=str(cwd) if cwd else None,
+                    env=self._env(env),
+                    start_new_session=True,
+                )
+            except (FileNotFoundError, PermissionError) as e:
+                return RunResult(list(argv), None, b"", b"", 0.0, error=str(e))
+            with self._active_lock:
+                self._active.add(proc.pid)
+            try:
+                _, err = proc.communicate(timeout=timeout)
+                dur = time.monotonic() - start
+                return RunResult(list(argv), proc.returncode, b"", err or b"", dur)
+            except subprocess.TimeoutExpired:
+                self._kill_group(proc)
+                try:
+                    _, err = proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    err = b""
+                dur = time.monotonic() - start
+                return RunResult(list(argv), proc.returncode, b"", err or b"", dur, timed_out=True)
+            finally:
+                with self._active_lock:
+                    self._active.discard(proc.pid)
+        finally:
+            self._notify("tool_end", argv)
+
     def kill_all(self) -> None:
         """SIGKILL every running tool's process group (hard-abort path)."""
         with self._active_lock:

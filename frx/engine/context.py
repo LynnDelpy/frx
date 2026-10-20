@@ -14,6 +14,7 @@ from typing import Any, Callable, Optional
 
 from ..flags.formats import FlagFormat
 from ..flags.needles import Needle
+from ..flags.scan import scan_flags
 from ..report.findings import Finding, FindingWriter
 from .queue import Item, WorkQueue
 from .runner import Runner
@@ -60,6 +61,29 @@ class Context:
             severity="flag", handler="", type="flag", value=value, item_sha=item.sha256,
             flag=True, confidence=1.0, provenance=provenance, command=command, offset=offset,
         ))
+
+    def scan_and_decode(self, item: Item, data: bytes, via: str, handler: str, command: str | None = None) -> None:
+        """Scan tool output for flags and feed it to the decoder.
+
+        Emits confirmed matches as flags AND generic (unconfirmed) matches as
+        candidates, so a tool-output scanner surfaces leads the same way the
+        binary handler does, instead of silently dropping candidate matches.
+        """
+        for hit in scan_flags(data, self.formats):
+            value = hit.value.decode("utf-8", "replace")
+            if hit.confirmed:
+                self.emit(Finding(
+                    severity="flag", handler=handler, type="flag", value=value, item_sha=item.sha256,
+                    flag=True, confidence=1.0, provenance=item.provenance + [via, value], command=command,
+                ))
+            else:
+                self.emit(Finding(
+                    severity="info", handler=handler, type="flag_candidate", value=value,
+                    item_sha=item.sha256, confidence=0.3,
+                    provenance=item.provenance + [via, value], command=command,
+                ))
+        if self.decoder is not None:
+            self.decoder.decode_candidate(data, item, item.provenance + [via])
 
     def child_dir(self, parent: Item) -> Path:
         d = self.extracted_dir / parent.sha256

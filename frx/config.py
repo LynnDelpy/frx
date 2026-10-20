@@ -24,10 +24,18 @@ def parse_size(v) -> int:
     if not s:
         return 0
     unit = s[-1]
-    if unit.isdigit():
-        return int(s)
-    num = float(s[:-1])
-    return int(num * _SIZE_UNITS[unit])
+    try:
+        if unit.isdigit():
+            return int(s)
+        mult = _SIZE_UNITS.get(unit)
+        if mult is None:
+            raise ValueError
+        return int(float(s[:-1]) * mult)
+    except ValueError:
+        raise ValueError(f"invalid size {v!r} (use e.g. 4G, 500M, 1024)")
+
+
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600}
 
 
 def parse_duration(v) -> float:
@@ -38,10 +46,15 @@ def parse_duration(v) -> float:
     if not s:
         return 0.0
     unit = s[-1]
-    if unit.isdigit():
-        return float(s)
-    num = float(s[:-1])
-    return num * {"s": 1, "m": 60, "h": 3600}[unit]
+    try:
+        if unit.isdigit():
+            return float(s)
+        mult = _DURATION_UNITS.get(unit)
+        if mult is None:
+            raise ValueError
+        return float(s[:-1]) * mult
+    except ValueError:
+        raise ValueError(f"invalid duration {v!r} (use e.g. 40m, 90s, 1h)")
 
 
 @dataclasses.dataclass

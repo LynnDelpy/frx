@@ -63,8 +63,13 @@ def _make_ui(args, mode, budget, queue):
 
 
 def _make_listener(runlog: RunLog, ui):
+    seen_flags: set = set()
+
     def listener(f: Finding) -> None:
-        if f.flag:
+        if f.flag and f.value not in seen_flags:
+            # Announce each distinct flag once: the same flag often lands via
+            # several paths/handlers, which would otherwise flood stdout/run.log.
+            seen_flags.add(f.value)
             runlog.line(f"FLAG {f.value}  [{' -> '.join(f.provenance)}]")
             if ui is not None:
                 ui.print_flag(f.value)
@@ -85,19 +90,22 @@ def cmd_run(args) -> int:
         from .engine.sandbox import reexec_under_sandbox
         reexec_under_sandbox(args.enforce_offline)  # may replace the process or exit
 
-    cfg = Config.load()
-    if args.jobs:
-        cfg.jobs = args.jobs
-    if args.max_depth is not None:
-        cfg.max_depth = args.max_depth
-    if args.max_files is not None:
-        cfg.max_files = args.max_files
-    if args.max_extracted_size:
-        cfg.max_extracted_size = parse_size(args.max_extracted_size)
-    if args.wordlist:
-        cfg.wordlist = args.wordlist
-
-    max_runtime = parse_duration(args.max_runtime) if args.max_runtime else None
+    try:
+        cfg = Config.load()
+        if args.jobs:
+            cfg.jobs = args.jobs
+        if args.max_depth is not None:
+            cfg.max_depth = args.max_depth
+        if args.max_files is not None:
+            cfg.max_files = args.max_files
+        if args.max_extracted_size:
+            cfg.max_extracted_size = parse_size(args.max_extracted_size)
+        if args.wordlist:
+            cfg.wordlist = args.wordlist
+        max_runtime = parse_duration(args.max_runtime) if args.max_runtime else None
+    except (ValueError, KeyError) as e:
+        print(f"frx run: {e}", file=sys.stderr)
+        return 2
 
     resuming = bool(args.resume)
     case_dir = Path(args.resume) if resuming else (Path(args.case) if args.case else _default_case())

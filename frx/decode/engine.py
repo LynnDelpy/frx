@@ -105,6 +105,19 @@ class DecodeEngine:
         # format match reachable only this way is a lead, not a confirmation.
         return step.startswith("xor:")
 
+    @staticmethod
+    def _plausible_flag(value: str) -> bool:
+        """A decoded flag body of mostly punctuation is a brute-decode
+        coincidence, not a real flag. Real CTF bodies are word-like."""
+        i, j = value.find("{"), value.rfind("}")
+        if i == -1 or j <= i:
+            return True  # no clear body to judge; don't second-guess
+        body = value[i + 1:j]
+        if not body:
+            return True
+        wordish = sum(1 for c in body if c.isalnum() or c in "_-")
+        return wordish / len(body) >= 0.6
+
     def _emit_flags(self, data: bytes, item, prov: list[str]) -> bool:
         brute = bool(prov) and self._is_brute(prov[-1])
         confirmed_found = False
@@ -112,7 +125,9 @@ class DecodeEngine:
             if not hit.confirmed:
                 continue
             value = hit.value.decode("utf-8", "replace")
-            if brute:
+            # XOR-brute matches, and matches whose body is punctuation soup, are
+            # decode coincidences: surface them as leads, not confirmed flags.
+            if brute or not self._plausible_flag(value):
                 self._emit_brute_candidate(value, item, prov)
                 continue
             confirmed_found = True

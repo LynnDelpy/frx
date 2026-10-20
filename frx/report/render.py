@@ -116,11 +116,17 @@ def render(case_dir: Path) -> str:
         lines.append(f"- `{f['value']}`  ·  `{_prov(f)}`")
     lines.append("")
 
-    # Per-handler counts.
+    # Per-handler counts, over deduped findings so a resumed/reprocessed item
+    # (whose handlers re-emit) does not inflate the totals.
     lines.append("## Per-handler summary")
     lines.append("")
     counts: dict[str, int] = {}
+    cseen_all: set = set()
     for f in findings:
+        key = (f.get("handler", "?"), f.get("type"), f.get("value"), tuple(f.get("provenance", [])))
+        if key in cseen_all:
+            continue
+        cseen_all.add(key)
         counts[f.get("handler", "?")] = counts.get(f.get("handler", "?"), 0) + 1
     for h, n in sorted(counts.items()):
         lines.append(f"- {h}: {n} finding(s)")

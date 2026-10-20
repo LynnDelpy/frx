@@ -92,8 +92,9 @@ def _process_fs(ctx: Context, item: Item, offset: int | None, tag: str) -> bool:
     if ctx.mode == "full":
         unalloc = ctx.child_dir(item) / f"unalloc_{tag}.bin"
         with unalloc.open("wb") as fh:
-            br = ctx.runner.run(["blkls", *oa, str(item.path)], timeout=ctx.runner.default_timeout)
-            fh.write(br.stdout)
+            # Stream blkls straight to disk: unallocated space is image-sized and
+            # must never be buffered whole in RAM.
+            ctx.runner.run_to_file(["blkls", *oa, str(item.path)], fh, timeout=ctx.runner.default_timeout)
         if unalloc.stat().st_size:
             ctx.enqueue_file(unalloc, item, f"disk:{tag}:unallocated")
 

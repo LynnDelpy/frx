@@ -8,7 +8,7 @@ matches are demoted to candidates so FLAGS.txt is not flooded with coincidences.
 """
 
 import base64
-import os
+import random
 import time
 
 from frx.decode import classic
@@ -108,7 +108,10 @@ def test_direct_presence_still_confirmed():
 def test_decode_is_bounded_on_base64_noise():
     ctx = _Ctx()
     eng = DecodeEngine(ctx)
-    noise = b"\n".join(base64.b64encode(os.urandom(300)) for _ in range(3000))  # ~1.6 MB
+    rng = random.Random(1234)  # deterministic noise so the assertion is stable
+    noise = b"\n".join(
+        base64.b64encode(bytes(rng.randrange(256) for _ in range(300))) for _ in range(3000)
+    )  # ~1.6 MB
     t0 = time.monotonic()
     eng.decode_candidate(noise, _Item(), ["raw"])
     elapsed = time.monotonic() - t0

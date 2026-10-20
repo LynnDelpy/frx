@@ -45,6 +45,7 @@ class ProgressUI:
         self._rows: dict[int, dict] = {}   # thread ident -> worker row
         self._slot_seq = 0
         self._flags: list[tuple[str, list]] = []
+        self._flag_values: set = set()
         self._counts = {"flag": 0, "high": 0, "info": 0}
         self._live = None
 
@@ -96,7 +97,8 @@ class ProgressUI:
             sev = getattr(f, "severity", "info")
             if sev in self._counts:
                 self._counts[sev] += 1
-            if getattr(f, "flag", False):
+            if getattr(f, "flag", False) and f.value not in self._flag_values:
+                self._flag_values.add(f.value)
                 self._flags.append((f.value, list(getattr(f, "provenance", []))))
 
     def print_flag(self, value: str) -> None:

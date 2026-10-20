@@ -15,7 +15,6 @@ from pathlib import Path
 
 from ..engine.context import Context
 from ..engine.queue import Item
-from ..flags.scan import scan_flags
 from ..report.findings import Finding
 
 
@@ -34,15 +33,7 @@ def _subtype(item: Item) -> str:
 
 
 def _scan_and_decode(ctx: Context, item: Item, data: bytes, via: str, command: str | None = None) -> None:
-    for hit in scan_flags(data, ctx.formats):
-        if hit.confirmed:
-            v = hit.value.decode("utf-8", "replace")
-            ctx.emit(Finding(
-                severity="flag", handler="document", type="flag", value=v, item_sha=item.sha256,
-                flag=True, confidence=1.0, provenance=item.provenance + [via, v], command=command,
-            ))
-    if ctx.decoder is not None:
-        ctx.decoder.decode_candidate(data, item, item.provenance + [via])
+    ctx.scan_and_decode(item, data, via, "document", command)
 
 
 def _resolve(name: str) -> list[str] | None:
@@ -61,9 +52,9 @@ def _pdf(ctx: Context, item: Item) -> None:
     pdftotext = shutil.which("pdftotext")
     if pdftotext:
         txt = ctx.child_dir(item) / f"{item.short}.txt"
-        ctx.runner.run([pdftotext, "-q", str(item.path), str(txt)], timeout=120)
+        res = ctx.runner.run([pdftotext, "-q", str(item.path), str(txt)], timeout=120)
         if txt.is_file() and txt.stat().st_size:
-            _scan_and_decode(ctx, item, txt.read_bytes(), "document:pdftotext")
+            _scan_and_decode(ctx, item, txt.read_bytes(), "document:pdftotext", res.command)
 
     if shutil.which("pdfdetach"):
         attach = ctx.child_dir(item) / "attachments"

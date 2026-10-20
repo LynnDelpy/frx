@@ -16,7 +16,6 @@ from pathlib import Path
 
 from ..engine.context import Context
 from ..engine.queue import Item
-from ..flags.scan import scan_flags
 from ..report.findings import Finding
 from . import vol
 
@@ -44,16 +43,7 @@ DUMPING_PLUGINS = {"windows.malfind.Malfind", "linux.malfind.Malfind", "mac.malf
 
 
 def _scan_output(ctx: Context, item: Item, text: str, plugin: str, command: str) -> None:
-    data = text.encode("utf-8", "replace")
-    for hit in scan_flags(data, ctx.formats):
-        if hit.confirmed:
-            v = hit.value.decode("utf-8", "replace")
-            ctx.emit(Finding(
-                severity="flag", handler="memory", type="flag", value=v, item_sha=item.sha256,
-                flag=True, confidence=1.0, provenance=item.provenance + [f"memory:{plugin}", v], command=command,
-            ))
-    if ctx.decoder is not None:
-        ctx.decoder.decode_candidate(data, item, item.provenance + [f"memory:{plugin}"])
+    ctx.scan_and_decode(item, text.encode("utf-8", "replace"), f"memory:{plugin}", "memory", command)
 
 
 def _banners(ctx: Context, item: Item) -> str:

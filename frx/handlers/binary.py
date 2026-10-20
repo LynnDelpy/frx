@@ -146,12 +146,24 @@ def handle(item: Item, ctx: Context) -> None:
             _emit_flag_hits(ctx, item, data, "raw", None, offset_known=True)
             _feed_decoder(ctx, item, data, "raw")
 
-    # Three strings passes, scanned for flags and needles.
+    # Three strings passes, scanned for flags and needles. strings output can be
+    # image-sized, so stream it to a temp file (bounded RAM) and scan a capped
+    # prefix rather than buffering it all through a pipe.
     for label, extra in STRINGS_PASSES:
-        res = ctx.runner.run(["strings", *extra, str(item.path)], timeout=ctx.runner.default_timeout)
-        if not res.stdout:
+        sfile = ctx.child_dir(item) / f"strings_{label}.txt"
+        with sfile.open("wb") as fh:
+            res = ctx.runner.run_to_file(["strings", *extra, str(item.path)], fh,
+                                         timeout=ctx.runner.default_timeout)
+        try:
+            size = sfile.stat().st_size
+        except OSError:
+            size = 0
+        if not size:
+            sfile.unlink(missing_ok=True)
             continue
-        data = res.stdout[:MAX_STRINGS_BYTES]
+        with sfile.open("rb") as fh:
+            data = fh.read(MAX_STRINGS_BYTES)
+        sfile.unlink(missing_ok=True)
         via = f"strings:{label}"
         _emit_flag_hits(ctx, item, data, via, res.command, offset_known=False)
         _feed_decoder(ctx, item, data, via)
