@@ -80,22 +80,34 @@ def _detect_os(ctx: Context, item: Item, installed: set[str]) -> str:
 
 def _sweep(ctx: Context, item: Item, plugins: list[str], installed: set[str]) -> None:
     dump_dir = ctx.child_dir(item) / "voldump"
+    to_run = []
     for plugin in plugins:
         if plugin not in installed:
             ctx.log(f"  memory: plugin not installed, skipped: {plugin}")
-            continue
+        else:
+            to_run.append(plugin)
+
+    def run_one(plugin: str) -> None:
         dd = dump_dir if plugin in DUMPING_PLUGINS else None
         extra = ["--dump"] if plugin in DUMPING_PLUGINS else None
-        res = vol.run_plugin(ctx, item, plugin, extra=extra, dump_dir=dd)
+        # Isolated cache per plugin: concurrent vol processes must not race on
+        # the shared symbol cache files.
+        cache = ctx.case_dir / "vol-cache" / plugin
+        res = vol.run_plugin(ctx, item, plugin, extra=extra, dump_dir=dd, cache_dir=cache)
         if res.timed_out:
             ctx.log(f"  memory: plugin timed out, skipped: {plugin}")
-            continue
+            return
         if res.stdout.strip():
             _scan_output(ctx, item, res.out_text(), plugin, res.command)
+
+    # Each plugin re-reads the (multi-GB) dump, so cap the fan-out to limit I/O
+    # amplification even when --jobs is high.
+    ctx.parallel([(lambda p=p: run_one(p)) for p in to_run], limit=min(ctx.jobs, 4))
+
     # Enqueue any dumped regions/files.
     if dump_dir.is_dir():
         for child in sorted(dump_dir.rglob("*")):
-            if child.is_file() and child.stat().st_size:
+            if child.is_file() and not child.is_symlink() and child.stat().st_size:
                 ctx.enqueue_file(child, item, f"memory:dump:{child.name}")
 
 

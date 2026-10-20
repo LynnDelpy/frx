@@ -13,6 +13,7 @@ import argparse
 import datetime as _dt
 import json
 import sys
+import threading
 from pathlib import Path
 
 from .config import Config, parse_duration, parse_size
@@ -171,7 +172,12 @@ def cmd_run(args) -> int:
 
         ui, console = _make_ui(args, mode, budget, queue)
         findings.add_listener(_make_listener(runlog, ui))
-        runner = Runner(case_dir, default_timeout=cfg.per_tool_timeout, logfn=runlog.line, observer=ui)
+        # One semaphore caps total concurrent external tools across item workers
+        # and handler-internal fan-out, so a single large input still uses every
+        # core without oversubscribing.
+        tool_sem = threading.BoundedSemaphore(max(1, cfg.jobs))
+        runner = Runner(case_dir, default_timeout=cfg.per_tool_timeout, logfn=runlog.line,
+                        observer=ui, concurrency=tool_sem)
         ctx = Context(
             runner=runner, findings=findings, queue=queue, formats=formats,
             needles=needles, case_dir=case_dir, mode=mode, wordlist=cfg.wordlist,

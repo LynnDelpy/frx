@@ -42,18 +42,21 @@ def _recon_stats(ctx: Context, item: Item) -> None:
             ))
 
 
+def _export_one(ctx: Context, item: Item, proto: str) -> None:
+    out = ctx.child_dir(item) / f"objects_{proto}"
+    out.mkdir(parents=True, exist_ok=True)
+    _tshark(ctx, item, ["--export-objects", f"{proto},{out}", "-q"])
+    n = 0
+    for child in sorted(out.rglob("*")):
+        if child.is_file() and not child.is_symlink() and child.stat().st_size:
+            if ctx.enqueue_file(child, item, f"pcap:{proto}-object:{child.name}"):
+                n += 1
+    if n:
+        ctx.log(f"  pcap {item.short}: exported {n} {proto} object(s)")
+
+
 def _export_objects(ctx: Context, item: Item) -> None:
-    for proto in OBJECT_PROTOCOLS:
-        out = ctx.child_dir(item) / f"objects_{proto}"
-        out.mkdir(parents=True, exist_ok=True)
-        _tshark(ctx, item, ["--export-objects", f"{proto},{out}", "-q"])
-        n = 0
-        for child in sorted(out.rglob("*")):
-            if child.is_file() and child.stat().st_size:
-                if ctx.enqueue_file(child, item, f"pcap:{proto}-object:{child.name}"):
-                    n += 1
-        if n:
-            ctx.log(f"  pcap {item.short}: exported {n} {proto} object(s)")
+    ctx.parallel([(lambda p=proto: _export_one(ctx, item, p)) for proto in OBJECT_PROTOCOLS])
 
 
 def _dns_exfil(ctx: Context, item: Item) -> None:
@@ -133,24 +136,28 @@ def _fields(ctx: Context, item: Item) -> None:
                 ctx.decoder.decode_candidate(raw, item, item.provenance + [f"pcap:{label}"])
 
 
+def _follow_one(ctx: Context, item: Item, n: int) -> None:
+    fr = _tshark(ctx, item, ["-q", "-z", f"follow,tcp,raw,{n}"], timeout=60)
+    hexdata = "".join(
+        line.strip() for line in fr.out_text().splitlines()
+        if line.strip() and all(c in "0123456789abcdefABCDEF" for c in line.strip())
+    )
+    if len(hexdata) < 8:
+        return
+    try:
+        raw = bytes.fromhex(hexdata)
+    except ValueError:
+        return
+    dump = ctx.child_dir(item) / f"tcp_stream_{n}.bin"
+    dump.write_bytes(raw)
+    ctx.enqueue_file(dump, item, f"pcap:tcp-stream-{n}")
+
+
 def _follow_streams(ctx: Context, item: Item) -> None:
     res = _tshark(ctx, item, ["-T", "fields", "-e", "tcp.stream"], timeout=120)
-    streams = {int(s) for s in res.out_text().split() if s.isdigit()}
-    for n in sorted(streams)[:MAX_STREAMS]:
-        fr = _tshark(ctx, item, ["-q", "-z", f"follow,tcp,raw,{n}"], timeout=60)
-        hexdata = "".join(
-            line.strip() for line in fr.out_text().splitlines()
-            if line.strip() and all(c in "0123456789abcdefABCDEF" for c in line.strip())
-        )
-        if len(hexdata) < 8:
-            continue
-        try:
-            raw = bytes.fromhex(hexdata)
-        except ValueError:
-            continue
-        dump = ctx.child_dir(item) / f"tcp_stream_{n}.bin"
-        dump.write_bytes(raw)
-        ctx.enqueue_file(dump, item, f"pcap:tcp-stream-{n}")
+    streams = sorted({int(s) for s in res.out_text().split() if s.isdigit()})[:MAX_STREAMS]
+    # Each stream follow is an independent read-only tshark call; fan them out.
+    ctx.parallel([(lambda k=n: _follow_one(ctx, item, k)) for n in streams])
 
 
 def handle(item: Item, ctx: Context) -> None:

@@ -26,6 +26,58 @@ def _ctx(tmp_path):
     )
 
 
+def test_parallel_runs_concurrently_and_preserves_order(tmp_path):
+    import threading
+    import time
+
+    ctx = Context(
+        runner=None, findings=FindingWriter(tmp_path), queue=WorkQueue(),
+        formats=build_formats(flag_formats=["CTF{...}"]), needles=[],
+        case_dir=tmp_path, mode="full", jobs=4,
+    )
+    peak = [0]
+    cur = [0]
+    lock = threading.Lock()
+
+    def work(i):
+        with lock:
+            cur[0] += 1
+            peak[0] = max(peak[0], cur[0])
+        time.sleep(0.05)
+        with lock:
+            cur[0] -= 1
+        if i == 3:
+            raise RuntimeError("boom")  # a failing task yields None, others continue
+        return i * i
+
+    res = ctx.parallel([(lambda k=i: work(k)) for i in range(8)])
+    ctx.findings.close()
+    assert res[0] == 0 and res[2] == 4 and res[7] == 49  # order preserved
+    assert res[3] is None                                # failure -> None, not a crash
+    assert peak[0] >= 2                                  # genuinely ran in parallel
+
+
+def test_runner_semaphore_caps_concurrent_tools(tmp_path):
+    import threading
+    import time
+
+    sem = threading.BoundedSemaphore(2)
+    r = Runner(tmp_path, nice=False, concurrency=sem)
+
+    def call():
+        r.run(["sleep", "0.3"], timeout=10)
+
+    threads = [threading.Thread(target=call) for _ in range(4)]
+    t0 = time.monotonic()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    elapsed = time.monotonic() - t0
+    # 4 x 0.3s sleeps, 2 at a time => ~0.6s; unbounded would be ~0.3s.
+    assert elapsed >= 0.5
+
+
 def test_run_to_file_streams_stdout_not_memory(tmp_path):
     r = Runner(tmp_path, nice=False)
     out = tmp_path / "o.bin"

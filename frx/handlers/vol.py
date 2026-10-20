@@ -43,10 +43,14 @@ def list_plugins(ctx: Context) -> set[str]:
 
 
 def run_plugin(ctx: Context, item: Item, plugin: str, extra: list[str] | None = None,
-               dump_dir: Path | None = None, timeout: float | None = None):
+               dump_dir: Path | None = None, timeout: float | None = None,
+               cache_dir: Path | None = None):
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    cache = cache_dir if cache_dir is not None else _cache_dir(ctx)
     argv = [
         "vol", "-q", "-r", "jsonl", "--offline",
-        "--cache-path", str(_cache_dir(ctx)),
+        "--cache-path", str(cache),
         "-s", str(symbols_dir(ctx)),
     ]
     if dump_dir is not None:

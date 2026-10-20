@@ -184,11 +184,10 @@ def handle(item: Item, ctx: Context) -> None:
     produced = False
     if has_tsk:
         parts = _partitions(ctx, item)
-        if parts:
-            for start, desc in parts:
-                produced = _process_fs(ctx, item, offset=start, tag=f"p{start}") or produced
-        else:
-            produced = _process_fs(ctx, item, offset=None, tag="fs") or produced
+        targets = [(start, f"p{start}") for start, _desc in parts] or [(None, "fs")]
+        # Partitions are independent TSK runs; process them concurrently.
+        results = ctx.parallel([(lambda o=off, t=tag: _process_fs(ctx, item, o, t)) for off, tag in targets])
+        produced = any(results)
 
     if not produced:
         # TSK absent or could not parse the filesystem: try the mount fallback.

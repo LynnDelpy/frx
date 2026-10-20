@@ -56,12 +56,17 @@ class Runner:
         nice: bool = True,
         logfn=None,
         observer=None,
+        concurrency=None,
     ):
         self.case_dir = Path(case_dir)
         self.default_timeout = default_timeout
         self.nice = nice and shutil.which("nice") is not None
         self.ionice = nice and shutil.which("ionice") is not None
         self._logfn = logfn
+        # A shared semaphore caps the TOTAL number of external tools running at
+        # once (across item workers and any handler-internal parallelism), so
+        # intra-handler fan-out never oversubscribes the machine.
+        self._concurrency = concurrency
         # Optional live-UI hook: observer.tool_start(argv)/tool_end(argv) are
         # called around each spawn so the per-worker display can show the tool
         # that is running and for how long. Never allowed to break a run.
@@ -104,6 +109,8 @@ class Runner:
         if self._logfn:
             self._logfn("exec: " + " ".join(shlex.quote(a) for a in argv))
         self._notify("tool_start", argv)
+        if self._concurrency is not None:
+            self._concurrency.acquire()
         start = time.monotonic()
         try:
             try:
@@ -139,6 +146,8 @@ class Runner:
                 with self._active_lock:
                     self._active.discard(proc.pid)
         finally:
+            if self._concurrency is not None:
+                self._concurrency.release()
             self._notify("tool_end", argv)
 
     def run_to_file(
@@ -164,6 +173,8 @@ class Runner:
         if self._logfn:
             self._logfn("exec: " + " ".join(shlex.quote(a) for a in argv))
         self._notify("tool_start", argv)
+        if self._concurrency is not None:
+            self._concurrency.acquire()
         start = time.monotonic()
         try:
             try:
@@ -196,6 +207,8 @@ class Runner:
                 with self._active_lock:
                     self._active.discard(proc.pid)
         finally:
+            if self._concurrency is not None:
+                self._concurrency.release()
             self._notify("tool_end", argv)
 
     def kill_all(self) -> None:
