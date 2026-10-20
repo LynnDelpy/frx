@@ -159,8 +159,15 @@ class WorkQueue:
     def _journal_add(self, item: Item, extracted: bool) -> None:
         if self._state_fh is None:
             return
+        # Store an absolute path: a resume may run from a different working
+        # directory, where the original relative path would not resolve and the
+        # pending item would be silently dropped.
+        try:
+            abs_path = str(Path(item.path).resolve())
+        except OSError:
+            abs_path = str(item.path)
         rec = {
-            "op": "a", "sha": item.sha256, "path": str(item.path), "kind": item.kind,
+            "op": "a", "sha": item.sha256, "path": abs_path, "kind": item.kind,
             "depth": item.depth, "parent": item.parent_sha, "prov": item.provenance,
             "size": item.size, "ext": bool(extracted),
         }

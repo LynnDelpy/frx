@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json
 import sys
 from pathlib import Path
 
@@ -98,16 +99,39 @@ def cmd_run(args) -> int:
 
     max_runtime = parse_duration(args.max_runtime) if args.max_runtime else None
 
-    formats = build_formats(
-        flag_formats=args.flag_format or cfg.flag_formats,
-        flag_regexes=args.flag_regex or cfg.flag_regexes,
-    )
-    needles = _collect_needles(formats)
-
     resuming = bool(args.resume)
     case_dir = Path(args.resume) if resuming else (Path(args.case) if args.case else _default_case())
     case_dir.mkdir(parents=True, exist_ok=True)
     state_path = case_dir / "queue-state.jsonl"
+    meta_path = case_dir / "run-meta.json"
+
+    # Resume restores the run-level parameters the journal does not hold (mode,
+    # flag formats, wordlist), so a resumed --mode full run does not silently
+    # revert to recon. An explicit CLI flag still overrides the saved value.
+    meta = {}
+    if resuming and meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+
+    mode = args.mode or meta.get("mode") or "recon"
+    flag_formats = args.flag_format or meta.get("flag_formats") or cfg.flag_formats
+    flag_regexes = args.flag_regex or meta.get("flag_regexes") or cfg.flag_regexes
+    if resuming and not args.wordlist and meta.get("wordlist"):
+        cfg.wordlist = meta["wordlist"]
+
+    formats = build_formats(flag_formats=flag_formats, flag_regexes=flag_regexes)
+    needles = _collect_needles(formats)
+
+    if not resuming:
+        try:
+            meta_path.write_text(json.dumps({
+                "mode": mode, "flag_formats": flag_formats, "flag_regexes": flag_regexes,
+                "wordlist": cfg.wordlist, "kind": args.kind,
+            }, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
 
     runlog = RunLog(case_dir)
     from .engine.sandbox import already_sandboxed
@@ -123,12 +147,12 @@ def cmd_run(args) -> int:
         else:
             queue = WorkQueue(cfg.max_depth, cfg.max_files, cfg.max_extracted_size, state_path=state_path)
 
-        ui, console = _make_ui(args, args.mode, budget, queue)
+        ui, console = _make_ui(args, mode, budget, queue)
         findings.add_listener(_make_listener(runlog, ui))
         runner = Runner(case_dir, default_timeout=cfg.per_tool_timeout, logfn=runlog.line, observer=ui)
         ctx = Context(
             runner=runner, findings=findings, queue=queue, formats=formats,
-            needles=needles, case_dir=case_dir, mode=args.mode, wordlist=cfg.wordlist,
+            needles=needles, case_dir=case_dir, mode=mode, wordlist=cfg.wordlist,
             vol_symbols=cfg.vol_symbols, build_isf=args.build_isf, system_map=args.system_map,
             vol_plugin_timeout=cfg.vol_plugin_timeout, logfn=runlog.line,
             jobs=cfg.jobs, budget=budget, ui=ui,
@@ -141,11 +165,20 @@ def cmd_run(args) -> int:
             budget.install_sigint()
         try:
             if resuming:
-                runlog.line(f"resuming case {case_dir} with {queue.pending} pending item(s), mode={args.mode}")
+                runlog.line(f"resuming case {case_dir} with {queue.pending} pending item(s), mode={mode}")
             else:
-                runlog.line(f"seeding {len(args.input)} input(s), mode={args.mode}, jobs={cfg.jobs}")
+                runlog.line(f"seeding {len(args.input)} input(s), mode={mode}, jobs={cfg.jobs}")
                 engine.seed(args.input, kind_override=args.kind)
-            _drive(engine, ui, console)
+            try:
+                _drive(engine, ui, console)
+            except KeyboardInterrupt:
+                # A hard abort that escaped the sequential drain: stop, kill any
+                # lingering tool, and still finalize the report below.
+                budget.stop("signal")
+                runlog.line("hard abort (second interrupt): finalizing with work so far")
+                killer = getattr(runner, "kill_all", None)
+                if killer is not None:
+                    killer()
         finally:
             budget.restore_sigint()
             queue.close()
@@ -201,7 +234,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     r = sub.add_parser("run", help="analyze inputs")
     r.add_argument("input", nargs="*")
-    r.add_argument("--mode", choices=["recon", "full"], default="recon")
+    r.add_argument("--mode", choices=["recon", "full"], default=None,
+                   help="recon (fast, read-only) or full (default recon; restored from the case on --resume)")
     r.add_argument("--flag-format", action="append", help="e.g. 'CTF{...}' (repeatable)")
     r.add_argument("--flag-regex", action="append", help="raw regex (repeatable)")
     r.add_argument("--kind", help="force input kind (memory, pcap, disk, ...)")

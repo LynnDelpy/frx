@@ -52,7 +52,8 @@ def _enqueue_tree(ctx: Context, item: Item, root: Path, label: str) -> int:
     return n
 
 
-def _process_fs(ctx: Context, item: Item, offset: int | None, tag: str) -> None:
+def _process_fs(ctx: Context, item: Item, offset: int | None, tag: str) -> bool:
+    """Process one filesystem via TSK. Returns True if TSK understood it."""
     oa = _offset_args(offset)
 
     fsstat = ctx.runner.run(["fsstat", *oa, str(item.path)], timeout=120)
@@ -90,18 +91,101 @@ def _process_fs(ctx: Context, item: Item, offset: int | None, tag: str) -> None:
         if unalloc.stat().st_size:
             ctx.enqueue_file(unalloc, item, f"disk:{tag}:unallocated")
 
+    return bool(fsstat.stdout.strip()) or n > 0
 
-def handle(item: Item, ctx: Context) -> None:
-    if shutil.which("tsk_recover") is None:
+
+def _mount_fallback(item: Item, ctx: Context) -> bool:
+    """Last-resort read-only loop mount (amendment A5): TSK then 7z are preferred,
+    so this only runs when TSK understood nothing AND the user passed --mount with
+    --no-sandbox (a loop mount cannot happen inside the unshare -rn sandbox).
+
+    udisksctl mounts the image read-only; files are copied into the case dir (so
+    they survive the immediate unmount) and enqueued. The copy is bounded by the
+    same total-size cap as any extraction, and the mount is always torn down.
+    """
+    from ..engine import sandbox
+
+    if not sandbox.can_loop_mount(ctx.enforce_offline, ctx.mount):
+        return False
+    try:
+        mounted = sandbox.loop_mount_ro(item.path, runner=ctx.runner)
+    except Exception as e:  # noqa: BLE001 - never let a mount tool kill the run
         ctx.emit(Finding(
             severity="info", handler="disk", type="artifact",
-            value="sleuthkit not available; disk image not parsed", item_sha=item.sha256,
-            provenance=item.provenance + ["disk:unavailable"],
+            value=f"loop mount error: {type(e).__name__}: {e}", item_sha=item.sha256,
+            provenance=item.provenance + ["disk:mount:error"],
         ))
-        return
-    parts = _partitions(ctx, item)
-    if parts:
-        for start, desc in parts:
-            _process_fs(ctx, item, offset=start, tag=f"p{start}")
-    else:
-        _process_fs(ctx, item, offset=None, tag="fs")
+        return False
+    if not mounted:
+        ctx.emit(Finding(
+            severity="info", handler="disk", type="artifact",
+            value="loop mount failed; nothing mounted", item_sha=item.sha256,
+            provenance=item.provenance + ["disk:mount:failed"],
+        ))
+        return False
+
+    dev, mp = mounted
+    ctx.emit(Finding(
+        severity="high", handler="disk", type="artifact",
+        value=f"mounted read-only at {mp}", item_sha=item.sha256,
+        provenance=item.provenance + ["disk:mount"],
+    ))
+    dest_root = ctx.child_dir(item) / "mount"
+    dest_root.mkdir(parents=True, exist_ok=True)
+    budget = ctx.queue.max_extracted_size
+    copied = 0
+    n = skipped = 0
+    try:
+        for child in sorted(mp.rglob("*")):
+            if not child.is_file() or child.is_symlink():
+                continue
+            try:
+                sz = child.stat().st_size
+            except OSError:
+                continue
+            if copied + sz > budget:
+                skipped += 1
+                continue
+            rel = child.relative_to(mp)
+            out = dest_root / rel
+            out.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(child, out)
+            except OSError:
+                continue
+            copied += sz
+            if ctx.enqueue_file(out, item, f"disk:mount:{rel}"):
+                n += 1
+    finally:
+        sandbox.loop_unmount(dev, runner=ctx.runner)
+    ctx.log(f"  disk mount: enqueued {n} file(s) from {mp}, skipped {skipped} over size budget")
+    if skipped:
+        ctx.emit(Finding(
+            severity="info", handler="disk", type="artifact",
+            value=f"mount copy stopped at size budget; {skipped} file(s) skipped",
+            item_sha=item.sha256, provenance=item.provenance + ["disk:mount:truncated"],
+        ))
+    return True
+
+
+def handle(item: Item, ctx: Context) -> None:
+    has_tsk = shutil.which("tsk_recover") is not None
+    produced = False
+    if has_tsk:
+        parts = _partitions(ctx, item)
+        if parts:
+            for start, desc in parts:
+                produced = _process_fs(ctx, item, offset=start, tag=f"p{start}") or produced
+        else:
+            produced = _process_fs(ctx, item, offset=None, tag="fs") or produced
+
+    if not produced:
+        # TSK absent or could not parse the filesystem: try the mount fallback.
+        if _mount_fallback(item, ctx):
+            return
+        if not has_tsk:
+            ctx.emit(Finding(
+                severity="info", handler="disk", type="artifact",
+                value="sleuthkit not available; disk image not parsed", item_sha=item.sha256,
+                provenance=item.provenance + ["disk:unavailable"],
+            ))

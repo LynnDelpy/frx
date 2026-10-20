@@ -7,9 +7,16 @@ tool calls are left to finish (or hit their own per-tool timeout); nothing new i
 started. The caller then finalizes findings.jsonl and renders report.md as usual,
 so the report always reflects everything found up to the stop.
 
-A second Ctrl-C escalates to a hard abort (KeyboardInterrupt) for a run wedged in
-a tool that ignores its timeout. The signal handler only runs in the main thread,
-which is where the engine's dispatch loop lives, so the flag is seen promptly.
+A second Ctrl-C escalates to a hard abort (KeyboardInterrupt): the engine stops
+waiting for in-flight items, SIGKILLs their still-running tools, and finalizes
+the report from the (already durable) findings.jsonl. A process truly stuck in
+uninterruptible kernel I/O cannot be reaped by any signal, here or from the
+shell, so that one case is bounded only by each tool's own timeout.
+
+The signal handler only runs in the main thread, which is where the engine's
+dispatch loop lives, so the flag is seen promptly. reason and the stop flag are
+set together under a lock, first writer wins, so a Ctrl-C that races the
+runtime-budget expiry is still reported as the interrupt it was.
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ class Budget:
         self.max_runtime = max_runtime if (max_runtime and max_runtime > 0) else None
         self._start = time.monotonic()
         self._stop = threading.Event()
+        self._reason_lock = threading.Lock()
         self.reason: Optional[str] = None  # "runtime" | "signal" | None
         self._prev_handler = None
         self._installed = False
@@ -51,16 +59,17 @@ class Budget:
         if self._stop.is_set():
             return True
         if self.max_runtime is not None and self.elapsed() >= self.max_runtime:
-            if self.reason is None:
-                self.reason = "runtime"
-            self._stop.set()
+            self.stop("runtime")
             return True
         return False
 
     def stop(self, reason: str = "manual") -> None:
-        if self.reason is None:
-            self.reason = reason
-        self._stop.set()
+        # reason + flag set atomically, first writer wins: a SIGINT that races
+        # the runtime deadline still records "signal", not "runtime".
+        with self._reason_lock:
+            if self.reason is None:
+                self.reason = reason
+            self._stop.set()
 
     @property
     def stopped(self) -> bool:

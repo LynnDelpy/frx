@@ -20,6 +20,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import threading
 from pathlib import Path
 
 
@@ -65,6 +66,10 @@ class Runner:
         # called around each spawn so the per-worker display can show the tool
         # that is running and for how long. Never allowed to break a run.
         self._observer = observer
+        # Process groups of currently-running tools, so a hard abort (second
+        # Ctrl-C) can SIGKILL them instead of waiting on their timeouts.
+        self._active: set[int] = set()
+        self._active_lock = threading.Lock()
         self._tmp = self.case_dir / "tmp"
         self._tmp.mkdir(parents=True, exist_ok=True)
 
@@ -113,17 +118,38 @@ class Runner:
                 )
             except (FileNotFoundError, PermissionError) as e:
                 return RunResult(list(argv), None, b"", b"", 0.0, error=str(e))
+            # new session => child pid is its own process-group id.
+            with self._active_lock:
+                self._active.add(proc.pid)
             try:
                 out, err = proc.communicate(input=input_bytes, timeout=timeout)
                 dur = time.monotonic() - start
                 return RunResult(list(argv), proc.returncode, out, err, dur)
             except subprocess.TimeoutExpired:
                 self._kill_group(proc)
-                out, err = proc.communicate()
+                try:
+                    # Bounded: a process wedged in uninterruptible I/O can survive
+                    # even SIGKILL, so never let the worker block here forever.
+                    out, err = proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    out, err = b"", b""
                 dur = time.monotonic() - start
                 return RunResult(list(argv), proc.returncode, out or b"", err or b"", dur, timed_out=True)
+            finally:
+                with self._active_lock:
+                    self._active.discard(proc.pid)
         finally:
             self._notify("tool_end", argv)
+
+    def kill_all(self) -> None:
+        """SIGKILL every running tool's process group (hard-abort path)."""
+        with self._active_lock:
+            pids = list(self._active)
+        for pid in pids:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
 
     def _notify(self, event: str, argv: list[str]) -> None:
         if self._observer is None:

@@ -79,6 +79,7 @@ class Engine:
         q = self.ctx.queue
         ex = ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="frx-worker")
         inflight: set = set()
+        hard_abort = False
         try:
             while True:
                 if self._stopped():
@@ -98,11 +99,28 @@ class Engine:
                     exc = fut.exception()
                     if exc is not None:  # _process catches handler errors itself
                         self.ctx.log(f"worker crashed: {type(exc).__name__}: {exc}")
+        except KeyboardInterrupt:
+            hard_abort = True
+            self.ctx.log("hard abort (second interrupt): killing in-flight tools")
         finally:
-            if inflight:
+            if not hard_abort and inflight:
+                # Graceful stop: let in-flight items finish (each tool is bounded
+                # by its own timeout). A Ctrl-C here escalates to a hard abort.
                 self.ctx.log(f"stopping: letting {len(inflight)} in-flight item(s) finish")
-                wait(inflight)
-            ex.shutdown(wait=True)
+                try:
+                    wait(inflight)
+                except KeyboardInterrupt:
+                    hard_abort = True
+                    self.ctx.log("hard abort during drain: killing in-flight tools")
+            if hard_abort:
+                killer = getattr(self.ctx.runner, "kill_all", None)
+                if killer is not None:
+                    killer()
+            for fut in inflight:
+                fut.cancel()
+            ex.shutdown(wait=not hard_abort, cancel_futures=True)
+        if hard_abort and self.ctx.budget is not None:
+            self.ctx.budget.stop("signal")
 
     def _process(self, item) -> None:
         """Run every handler for one item, isolating failures, then mark done."""

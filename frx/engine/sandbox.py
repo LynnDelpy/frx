@@ -121,13 +121,28 @@ def can_loop_mount(enforce_offline: bool, mount_flag: bool) -> bool:
     return bool(mount_flag) and not enforce_offline and shutil.which("udisksctl") is not None
 
 
-def _parse_udisks_path(text: str, key: str) -> Optional[str]:
-    # udisksctl prints e.g. "Mapped file ... as /dev/loop0." or
-    # "Mounted /dev/loop0 at /run/media/user/LABEL."
+def _parse_loop_device(text: str) -> Optional[str]:
+    # "Mapped file ... as /dev/loop0." -> the /dev/loop* token.
     for token in text.replace(".", " ").split():
-        if token.startswith(key):
+        if token.startswith("/dev/loop"):
             return token
     return None
+
+
+def _parse_mountpoint(text: str) -> Optional[str]:
+    # "Mounted /dev/loop0 at /run/media/user/LABEL." -> the path after " at ".
+    marker = " at "
+    i = text.find(marker)
+    if i != -1:
+        mp = text[i + len(marker):].strip().rstrip(".").strip()
+        if mp.startswith("/"):
+            return mp
+    # Fallback: the LAST path-like token (the mountpoint follows the device).
+    cand = None
+    for token in text.replace(".", " ").split():
+        if token.startswith("/") and not token.startswith("/dev/"):
+            cand = token
+    return cand
 
 
 def loop_mount_ro(image: Path, runner=None) -> Optional[tuple[str, Path]]:
@@ -136,6 +151,8 @@ def loop_mount_ro(image: Path, runner=None) -> Optional[tuple[str, Path]]:
     Returns (loop_device, mountpoint) on success, or None. Runs outside any
     namespace. Uses udisksctl so no root is needed. Read-only is requested at
     loop-setup (-r); udisksctl then mounts without exec/suid by default policy.
+    The loop device is always torn back down if the mount step fails or raises,
+    so a partial failure never leaks a /dev/loop* binding.
     """
     def _run(argv):
         if runner is not None:
@@ -147,14 +164,17 @@ def loop_mount_ro(image: Path, runner=None) -> Optional[tuple[str, Path]]:
         return data.decode("utf-8", "replace") if isinstance(data, bytes) else str(data)
 
     setup = _run(["udisksctl", "loop-setup", "-r", "-f", str(image)])
-    dev = _parse_udisks_path(_out(setup), "/dev/loop")
+    dev = _parse_loop_device(_out(setup))
     if not dev:
         return None
-    mnt = _run(["udisksctl", "mount", "-b", dev])
-    mountpoint = _parse_udisks_path(_out(mnt), "/")
+    try:
+        mnt = _run(["udisksctl", "mount", "-b", dev])
+        mountpoint = _parse_mountpoint(_out(mnt))
+    except Exception:
+        loop_unmount(dev, runner=runner)
+        raise
     if not mountpoint:
-        # mount failed; tear the loop device back down so we leak nothing.
-        _run(["udisksctl", "loop-delete", "-b", dev])
+        loop_unmount(dev, runner=runner)
         return None
     return dev, Path(mountpoint)
 

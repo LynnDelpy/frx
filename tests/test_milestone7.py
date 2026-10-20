@@ -8,6 +8,7 @@ handler finds without any helper binary.
 
 import os
 import signal
+from pathlib import Path
 
 import pytest
 
@@ -260,6 +261,220 @@ def test_run_setup_prints_and_returns_zero(capsys):
 
 
 # -- budget stops the engine --------------------------------------------
+
+# -- review fixes -------------------------------------------------------
+
+def test_budget_signal_wins_over_runtime():
+    # The reason race: a SIGINT recorded first must not be relabelled 'runtime'
+    # when the deadline also passes.
+    b = Budget(1.0)
+    b.stop("signal")
+    b._start -= 100  # the runtime deadline is now also in the past
+    assert b.should_stop()
+    assert b.reason == "signal"
+
+
+def test_runner_kill_all_no_active_is_noop(tmp_path):
+    from frx.engine.runner import Runner
+
+    Runner(tmp_path, nice=False).kill_all()  # must not raise
+
+
+def test_runner_kill_all_terminates_running_tool(tmp_path):
+    import threading
+    import time
+
+    from frx.engine.runner import Runner
+
+    r = Runner(tmp_path, nice=False)
+    out = {}
+
+    def worker():
+        out["res"] = r.run(["sleep", "30"], timeout=60)
+
+    t = threading.Thread(target=worker)
+    t.start()
+    for _ in range(100):  # wait for the tool to register
+        if r._active:
+            break
+        time.sleep(0.02)
+    assert r._active, "the running tool should be registered"
+    r.kill_all()
+    t.join(timeout=10)
+    assert not t.is_alive(), "kill_all should let the blocked run return promptly"
+    assert out["res"].returncode is not None
+
+
+def test_udisks_output_parsing():
+    assert sandbox._parse_loop_device("Mapped file foo as /dev/loop3.") == "/dev/loop3"
+    assert sandbox._parse_mountpoint("Mounted /dev/loop0 at /run/media/u/LABEL.") == "/run/media/u/LABEL"
+    assert sandbox._parse_mountpoint("mounted at /mnt/x") == "/mnt/x"
+    assert sandbox._parse_mountpoint("Error mounting") is None
+
+
+def test_loop_mount_ro_success_and_failure_cleanup():
+    from frx.engine.runner import RunResult
+
+    class OK:
+        def run(self, argv, timeout=None, **k):
+            if argv[1] == "loop-setup":
+                return RunResult(argv, 0, b"Mapped file x as /dev/loop7.", b"", 0.0)
+            if argv[1] == "mount":
+                return RunResult(argv, 0, b"Mounted /dev/loop7 at /run/media/u/DISK.", b"", 0.0)
+            return RunResult(argv, 0, b"", b"", 0.0)
+
+    assert sandbox.loop_mount_ro(Path("/tmp/x.img"), runner=OK()) == ("/dev/loop7", Path("/run/media/u/DISK"))
+
+    class FailMount:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, argv, timeout=None, **k):
+            self.calls.append(argv[1])
+            if argv[1] == "loop-setup":
+                return RunResult(argv, 0, b"Mapped file x as /dev/loop8.", b"", 0.0)
+            return RunResult(argv, 0, b"nope", b"", 0.0)
+
+    fr = FailMount()
+    assert sandbox.loop_mount_ro(Path("/tmp/x.img"), runner=fr) is None
+    assert "loop-delete" in fr.calls  # the loop device is torn back down
+
+
+def test_build_isf_atomic_valid_xz(tmp_path, monkeypatch):
+    import lzma
+
+    from frx.engine.context import Context
+    from frx.engine.queue import WorkQueue
+    from frx.engine.runner import RunResult
+    from frx.flags.formats import build_formats
+    from frx.handlers import vol
+    from frx.report.findings import FindingWriter
+
+    monkeypatch.setattr(vol.shutil, "which", lambda n: "/usr/bin/dwarf2json")
+    payload = b'{"symbols": {"x": 1}}'
+
+    class FR:
+        default_timeout = 300.0
+
+        def run(self, argv, timeout=None, **k):
+            return RunResult(argv, 0, payload, b"", 0.01)
+
+    syms = tmp_path / "symbols"
+    fw = FindingWriter(tmp_path)
+    ctx = Context(
+        runner=FR(), findings=fw, queue=WorkQueue(),
+        formats=build_formats(flag_formats=["CTF{...}"]), needles=[],
+        case_dir=tmp_path, vol_symbols=str(syms),
+    )
+    dest = vol.build_isf(ctx, "/boot/vmlinux-test", None)
+    fw.close()
+    assert dest is not None and dest.is_file()
+    assert lzma.open(dest).read() == payload                     # valid, complete
+    assert not list((syms / "linux").glob("*.tmp"))              # no temp left
+
+
+def test_disk_mount_fallback_copies_and_enqueues(tmp_path, monkeypatch):
+    from frx.engine import sandbox as sb
+    from frx.engine.context import Context
+    from frx.engine.queue import WorkQueue
+    from frx.engine.runner import Runner
+    from frx.flags.formats import build_formats
+    from frx.handlers import disk
+    from frx.report.findings import FindingWriter
+
+    mnt = tmp_path / "mnt"
+    (mnt / "sub").mkdir(parents=True)
+    (mnt / "a.txt").write_bytes(b"CTF{from_mount}\n")
+    (mnt / "sub" / "b.txt").write_bytes(b"hello\n")
+    torn_down = {}
+
+    monkeypatch.setattr(disk.shutil, "which", lambda n: None)  # tsk absent -> fallback
+    monkeypatch.setattr(sb, "can_loop_mount", lambda enforce, mount: True)
+    monkeypatch.setattr(sb, "loop_mount_ro", lambda img, runner=None: ("/dev/loop9", mnt))
+    monkeypatch.setattr(sb, "loop_unmount", lambda dev, runner=None: torn_down.setdefault("dev", dev))
+
+    case = tmp_path / "case"
+    case.mkdir()
+    q = WorkQueue()
+    ctx = Context(
+        runner=Runner(case, nice=False), findings=FindingWriter(case), queue=q,
+        formats=build_formats(flag_formats=["CTF{...}"]), needles=[], case_dir=case,
+        mode="full", mount=True, enforce_offline=False,
+    )
+    img = tmp_path / "disk.img"
+    img.write_bytes(b"\x00" * 64)
+    item = q.make_item(img, "disk_image", 0, None, ["disk.img"])
+    disk.handle(item, ctx)
+    ctx.findings.close()
+
+    assert torn_down.get("dev") == "/dev/loop9"  # always unmounted
+    assert q.pending >= 2                         # both files copied + enqueued
+    assert (case / "extracted" / item.sha256 / "mount" / "a.txt").is_file()
+
+
+def test_journal_stores_absolute_paths(tmp_path, monkeypatch):
+    # Resume must work from a different CWD: the journal must not keep the
+    # relative path the input was given on the command line.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "rel.bin").write_bytes(b"data")
+    sp = tmp_path / "queue-state.jsonl"
+    q = WorkQueue(state_path=sp)
+    it = q.make_item(Path("rel.bin"), "other", 0, None, ["rel.bin"])  # relative path
+    q.add(it)
+    q.close()
+    import json
+    rec = json.loads(sp.read_text().splitlines()[0])
+    assert rec["path"].startswith("/") and rec["path"].endswith("/rel.bin")
+
+
+def test_resume_restores_mode_and_formats(tmp_path):
+    import json
+
+    indir = tmp_path / "in"
+    indir.mkdir()
+    (indir / "f.txt").write_bytes(b"CTF{resume_mode}\n")
+    case = tmp_path / "case"
+    rc = main(["run", str(indir / "f.txt"), "--mode", "full", "--flag-format", "CTF{...}",
+               "--case", str(case), "--jobs", "1", "--no-progress"])
+    assert rc == 0
+    meta = json.loads((case / "run-meta.json").read_text())
+    assert meta["mode"] == "full"
+    assert meta["flag_formats"] == ["CTF{...}"]
+
+    # Resume with NO --mode/--flag-format must restore full + formats, not revert to recon.
+    rc2 = main(["run", "--resume", str(case), "--no-progress"])
+    assert rc2 == 0
+    log = (case / "run.log").read_text()
+    assert any("resuming" in l and "mode=full" in l for l in log.splitlines())
+    assert "CTF{resume_mode}" in (case / "FLAGS.txt").read_text()
+
+
+def test_render_dedupes_nonflag_sections(tmp_path):
+    import json
+
+    from frx.report.render import render
+
+    recs = [
+        {"severity": "high", "handler": "disk", "type": "artifact", "value": "deleted entry: x",
+         "item_sha": "a", "provenance": ["img", "disk"]},
+        {"severity": "high", "handler": "disk", "type": "artifact", "value": "deleted entry: x",
+         "item_sha": "a", "provenance": ["img", "disk"]},
+        {"severity": "info", "handler": "decode", "type": "decoded", "value": "hello",
+         "item_sha": "a", "provenance": ["img", "base64"], "confidence": 0.4},
+        {"severity": "info", "handler": "decode", "type": "decoded", "value": "hello",
+         "item_sha": "a", "provenance": ["img", "base64"], "confidence": 0.4},
+        {"severity": "info", "handler": "engine", "type": "extracted_file", "value": "extracted/a/f",
+         "item_sha": "b", "provenance": ["img", "x"]},
+        {"severity": "info", "handler": "engine", "type": "extracted_file", "value": "extracted/a/f",
+         "item_sha": "b", "provenance": ["img", "x"]},
+    ]
+    (tmp_path / "findings.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+    out = render(tmp_path)
+    assert out.count("deleted entry: x") == 1
+    assert out.count("`hello`") == 1
+    assert out.count("extracted/a/f") == 1
+    assert "1 file(s) extracted." in out
+
 
 def test_pre_stopped_budget_dispatches_nothing(tmp_path):
     from frx.engine.context import Context
