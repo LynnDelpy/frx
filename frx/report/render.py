@@ -31,14 +31,33 @@ def _prov(f: dict) -> str:
     return " -> ".join(f.get("provenance", []))
 
 
+def _dedupe(items: list[dict]) -> list[dict]:
+    """Drop findings identical in value + provenance, preserving first order.
+
+    A resume reprocesses any item that was interrupted before it was marked
+    done, so its handlers re-emit the same findings into findings.jsonl. Only
+    flags are deduped at write time; this keeps the other report sections from
+    listing the same artifact/decode/extracted entry twice.
+    """
+    seen: set = set()
+    out: list[dict] = []
+    for f in items:
+        key = (f.get("type"), f.get("value"), tuple(f.get("provenance", [])))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(f)
+    return out
+
+
 def render(case_dir: Path) -> str:
     case_dir = Path(case_dir)
     findings = _load(case_dir)
     flags = [f for f in findings if f.get("flag")]
     candidates = [f for f in findings if f.get("type") == "flag_candidate"]
-    decoded = [f for f in findings if f.get("type") == "decoded"]
-    extracted = [f for f in findings if f.get("type") == "extracted_file"]
-    artifacts = [f for f in findings if f.get("type") == "artifact" and f.get("severity") == "high"]
+    decoded = _dedupe([f for f in findings if f.get("type") == "decoded"])
+    extracted = _dedupe([f for f in findings if f.get("type") == "extracted_file"])
+    artifacts = _dedupe([f for f in findings if f.get("type") == "artifact" and f.get("severity") == "high"])
 
     lines: list[str] = []
     lines.append(f"# frx report: {case_dir.name}")
@@ -97,11 +116,17 @@ def render(case_dir: Path) -> str:
         lines.append(f"- `{f['value']}`  ·  `{_prov(f)}`")
     lines.append("")
 
-    # Per-handler counts.
+    # Per-handler counts, over deduped findings so a resumed/reprocessed item
+    # (whose handlers re-emit) does not inflate the totals.
     lines.append("## Per-handler summary")
     lines.append("")
     counts: dict[str, int] = {}
+    cseen_all: set = set()
     for f in findings:
+        key = (f.get("handler", "?"), f.get("type"), f.get("value"), tuple(f.get("provenance", [])))
+        if key in cseen_all:
+            continue
+        cseen_all.add(key)
         counts[f.get("handler", "?")] = counts.get(f.get("handler", "?"), 0) + 1
     for h, n in sorted(counts.items()):
         lines.append(f"- {h}: {n} finding(s)")

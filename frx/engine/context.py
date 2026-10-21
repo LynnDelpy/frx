@@ -14,6 +14,7 @@ from typing import Any, Callable, Optional
 
 from ..flags.formats import FlagFormat
 from ..flags.needles import Needle
+from ..flags.scan import scan_flags
 from ..report.findings import Finding, FindingWriter
 from .queue import Item, WorkQueue
 from .runner import Runner
@@ -36,6 +37,12 @@ class Context:
     max_inmem: int = 64 * 1024**2  # scan raw bytes directly below this size
     decoder: Any = None  # set by the engine once the decode engine exists
     logfn: Optional[Callable[[str], None]] = None
+    jobs: int = 1  # parallel item workers; >1 drains the queue in a thread pool
+    budget: Any = None  # engine.budget.Budget: runtime cap + SIGINT graceful stop
+    ui: Any = None  # progress.ui.ProgressUI when attached to a TTY, else None
+    enforce_offline: bool = True  # whether the pass runs inside the unshare -rn sandbox
+    mount: bool = False  # allow a read-only loop mount as a last resort (needs --no-sandbox)
+    use_gpu: bool = False  # opt-in OpenCL XOR-brute acceleration in the decoder
 
     @property
     def extracted_dir(self) -> Path:
@@ -55,6 +62,70 @@ class Context:
             severity="flag", handler="", type="flag", value=value, item_sha=item.sha256,
             flag=True, confidence=1.0, provenance=provenance, command=command, offset=offset,
         ))
+
+    def scan_and_decode(self, item: Item, data: bytes, via: str, handler: str, command: str | None = None) -> None:
+        """Scan tool output for flags and feed it to the decoder.
+
+        Emits confirmed matches as flags AND generic (unconfirmed) matches as
+        candidates, so a tool-output scanner surfaces leads the same way the
+        binary handler does, instead of silently dropping candidate matches.
+        """
+        for hit in scan_flags(data, self.formats):
+            value = hit.value.decode("utf-8", "replace")
+            if hit.confirmed:
+                self.emit(Finding(
+                    severity="flag", handler=handler, type="flag", value=value, item_sha=item.sha256,
+                    flag=True, confidence=1.0, provenance=item.provenance + [via, value], command=command,
+                ))
+            else:
+                self.emit(Finding(
+                    severity="info", handler=handler, type="flag_candidate", value=value,
+                    item_sha=item.sha256, confidence=0.3,
+                    provenance=item.provenance + [via, value], command=command,
+                ))
+        if self.decoder is not None:
+            self.decoder.decode_candidate(data, item, item.provenance + [via])
+
+    def parallel(self, thunks, limit=None) -> list:
+        """Run independent, I/O-bound tool thunks concurrently, in input order.
+
+        Handlers use this to fan out their many sequential external-tool calls
+        (pcap stream follows, vol plugins, disk partitions) across cores for a
+        single large item. The runner's shared semaphore caps total concurrent
+        tools, so this never oversubscribes; with jobs<=1 it runs sequentially.
+        A thunk that raises yields None (fail per item, continue), and no new
+        thunk is started once the budget says stop.
+        """
+        tasks = list(thunks)
+        if not tasks:
+            return []
+        width = min(limit or self.jobs or 1, len(tasks))
+        stopped = lambda: self.budget is not None and self.budget.should_stop()  # noqa: E731
+        if width <= 1:
+            out = []
+            for t in tasks:
+                if stopped():
+                    break
+                try:
+                    out.append(t())
+                except Exception as e:
+                    self.log(f"  parallel task error: {type(e).__name__}: {e}")
+                    out.append(None)
+            return out
+        from concurrent.futures import ThreadPoolExecutor
+        results: list = [None] * len(tasks)
+        with ThreadPoolExecutor(max_workers=width, thread_name_prefix="frx-sub") as ex:
+            futs = {}
+            for i, t in enumerate(tasks):
+                if stopped():
+                    break
+                futs[ex.submit(t)] = i
+            for f, i in futs.items():
+                try:
+                    results[i] = f.result()
+                except Exception as e:
+                    self.log(f"  parallel task error: {type(e).__name__}: {e}")
+        return results
 
     def child_dir(self, parent: Item) -> Path:
         d = self.extracted_dir / parent.sha256

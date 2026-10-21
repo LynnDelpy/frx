@@ -1,0 +1,54 @@
+# frx dependency manifest (spec section 9, amendments A8/A14).
+#
+# `frx setup` reads this to print the exact install commands; `frx check`
+# verifies the resulting binaries are on PATH before a run. Package names are the
+# current Arch names: 7zip (not p7zip), unarchiver (not unar), libisoburn for
+# xorriso, poppler for pdftotext/pdfdetach. dwarf2json is taken from its GitHub
+# release binary rather than built from the Go AUR package (A14), and
+# bulk_extractor is in neither the repos nor the AUR so it is not listed here (A8;
+# `check` reports it as an optional miss).
+
+[pacman]
+pkgs = [
+    "python", "python-rich", "python-magic",
+    "wireshark-cli", "sleuthkit", "binwalk", "foremost",
+    "perl-image-exiftool", "7zip", "unarchiver", "ripgrep",
+    "steghide", "outguess", "pngcheck", "qpdf", "poppler",
+    "libisoburn", "john", "fcrackzip",
+]
+
+[aur]            # paru/yay; prompt if neither is present
+pkgs = ["stegseek", "zsteg", "jpeginfo"]
+
+[pipx]           # volatility3 and oletools: any install that puts vol/olevba on PATH is accepted (A14)
+pkgs = ["volatility3", "oletools"]
+
+[gem]            # ruby gem; zsteg ships as a gem if the AUR package is unwanted
+pkgs = ["zsteg"]
+
+[python_magic]   # libmagic binding used by engine/identify.py
+pkgs = ["python-magic"]
+
+[symbols]
+# vol3 symbol packs -> $VOL_SYMBOLS (default ~/.local/share/frx/symbols).
+# Linux has NO pack: it is built per dump via dwarf2json (frx run --build-isf).
+windows = "https://downloads.volatilityfoundation.org/volatility3/symbols/windows.zip"
+mac     = "https://downloads.volatilityfoundation.org/volatility3/symbols/mac.zip"
+
+[wordlists]      # only fetched with `setup --with-wordlists`
+rockyou = "https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt"
+
+[gpu]            # optional: `frx run --gpu` accelerates the decoder's XOR brute
+# Needs an OpenCL runtime for your GPU plus the Python bindings:
+#   AMD:   pacman -S --needed opencl-mesa   (or rocm-opencl-runtime)
+#   Intel: pacman -S --needed intel-compute-runtime
+# then: pipx inject volatility3 pyopencl numpy   (or pip install pyopencl numpy)
+pkgs = ["pyopencl", "numpy"]
+
+[tools]
+# Unpackaged helpers installed into ~/.local/share/frx/tools (A8/A14).
+# dwarf2json: GitHub release binary (no Go build needed).
+dwarf2json  = "https://github.com/volatilityfoundation/dwarf2json/releases/latest"
+# Didier Stevens' PDF triage scripts (not packaged).
+pdfid       = "https://raw.githubusercontent.com/DidierStevens/DidierStevensSuite/master/pdfid.py"
+pdf_parser  = "https://raw.githubusercontent.com/DidierStevens/DidierStevensSuite/master/pdf-parser.py"

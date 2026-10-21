@@ -18,63 +18,88 @@ class Variant:
     data: bytes
 
 
+# Every transform here is a fixed byte->byte mapping, so each is precomputed once
+# as a 256-byte translation table and applied with bytes.translate() (a C-speed
+# loop). This matters: the decoder runs these over thousands of candidate tokens,
+# and a per-byte Python loop made that the dominant cost of a full pass.
+
+def _build_rot_table(n: int) -> bytes:
+    t = bytearray(range(256))
+    for b in range(65, 91):
+        t[b] = (b - 65 + n) % 26 + 65
+    for b in range(97, 123):
+        t[b] = (b - 97 + n) % 26 + 97
+    return bytes(t)
+
+
+_ROT_TABLES = [_build_rot_table(n) for n in range(26)]
+
+
+def _build_rot47_table() -> bytes:
+    t = bytearray(range(256))
+    for b in range(33, 127):
+        t[b] = (b - 33 + 47) % 94 + 33
+    return bytes(t)
+
+
+_ROT47_TABLE = _build_rot47_table()
+
+
+def _build_atbash_table() -> bytes:
+    t = bytearray(range(256))
+    for b in range(65, 91):
+        t[b] = 90 - (b - 65)
+    for b in range(97, 123):
+        t[b] = 122 - (b - 97)
+    return bytes(t)
+
+
+_ATBASH_TABLE = _build_atbash_table()
+
+# One translation table per XOR key (key 0 is identity and unused by xor_brute).
+_XOR_TABLES = [bytes(i ^ k for i in range(256)) for k in range(256)]
+
+
 def _rot_n(data: bytes, n: int) -> bytes:
-    out = bytearray()
-    for b in data:
-        if 65 <= b <= 90:
-            out.append((b - 65 + n) % 26 + 65)
-        elif 97 <= b <= 122:
-            out.append((b - 97 + n) % 26 + 97)
-        else:
-            out.append(b)
-    return bytes(out)
+    return data.translate(_ROT_TABLES[n % 26])
 
 
 def rot47(data: bytes) -> bytes:
-    out = bytearray()
-    for b in data:
-        if 33 <= b <= 126:
-            out.append((b - 33 + 47) % 94 + 33)
-        else:
-            out.append(b)
-    return bytes(out)
+    return data.translate(_ROT47_TABLE)
 
 
 def atbash(data: bytes) -> bytes:
-    out = bytearray()
-    for b in data:
-        if 65 <= b <= 90:
-            out.append(90 - (b - 65))
-        elif 97 <= b <= 122:
-            out.append(122 - (b - 97))
-        else:
-            out.append(b)
-    return bytes(out)
+    return data.translate(_ATBASH_TABLE)
 
 
 def rotations(data: bytes) -> list[Variant]:
-    return [Variant(f"rot{n}", _rot_n(data, n)) for n in range(1, 26)]
+    return [Variant(f"rot{n}", data.translate(_ROT_TABLES[n])) for n in range(1, 26)]
 
 
-def xor_brute(data: bytes) -> list[Variant]:
-    out = []
-    for key in range(1, 256):
-        out.append(Variant(f"xor:0x{key:02x}", bytes(b ^ key for b in data)))
-    return out
+def xor_brute(data: bytes, keys=None) -> list[Variant]:
+    ks = range(1, 256) if keys is None else keys
+    return [Variant(f"xor:0x{key:02x}", data.translate(_XOR_TABLES[key])) for key in ks]
 
 
-def conditional_variants(data: bytes, xor_max_len: int = 2048) -> list[Variant]:
+COND_MAX_LEN = 8192  # a Caesar/XOR-wrapped flag is short; skip these on long runs
+
+
+def conditional_variants(data: bytes, xor_max_len: int = 2048, xor_keys=None) -> list[Variant]:
     """All charset-preserving / conditional transform outputs for a token.
 
-    Single-byte XOR brute is skipped for long tokens: a flag defeated by only a
-    one-byte XOR is short, and brute-forcing 255 keys over a long high-entropy
-    run is pure cost (amendment A3 keeps XOR, this just bounds it).
+    A flag defeated by only a rotation or single-byte XOR is short, so these
+    length-preserving transforms are skipped entirely above COND_MAX_LEN (each
+    one copies the whole token, and brute-forcing them over a long high-entropy
+    run is pure cost). XOR brute is bounded tighter still (amendment A3 keeps the
+    transforms; this only bounds them).
     """
+    if len(data) > COND_MAX_LEN:
+        return []
     variants: list[Variant] = []
     variants.extend(rotations(data))
     variants.append(Variant("rot47", rot47(data)))
     variants.append(Variant("atbash", atbash(data)))
     variants.append(Variant("reversed", data[::-1]))
     if len(data) <= xor_max_len:
-        variants.extend(xor_brute(data))
+        variants.extend(xor_brute(data, keys=xor_keys))
     return variants

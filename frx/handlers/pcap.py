@@ -23,6 +23,7 @@ RECON_STATS = (
     ("tcp-conversations", ["-z", "conv,tcp", "-q"]),
     ("udp-conversations", ["-z", "conv,udp", "-q"]),
     ("ip-endpoints", ["-z", "endpoints,ip", "-q"]),
+    ("http-tree", ["-z", "http,tree", "-q"]),  # spec section 6.2
 )
 
 
@@ -41,18 +42,21 @@ def _recon_stats(ctx: Context, item: Item) -> None:
             ))
 
 
+def _export_one(ctx: Context, item: Item, proto: str) -> None:
+    out = ctx.child_dir(item) / f"objects_{proto}"
+    out.mkdir(parents=True, exist_ok=True)
+    _tshark(ctx, item, ["--export-objects", f"{proto},{out}", "-q"])
+    n = 0
+    for child in sorted(out.rglob("*")):
+        if child.is_file() and not child.is_symlink() and child.stat().st_size:
+            if ctx.enqueue_file(child, item, f"pcap:{proto}-object:{child.name}"):
+                n += 1
+    if n:
+        ctx.log(f"  pcap {item.short}: exported {n} {proto} object(s)")
+
+
 def _export_objects(ctx: Context, item: Item) -> None:
-    for proto in OBJECT_PROTOCOLS:
-        out = ctx.child_dir(item) / f"objects_{proto}"
-        out.mkdir(parents=True, exist_ok=True)
-        _tshark(ctx, item, ["--export-objects", f"{proto},{out}", "-q"])
-        n = 0
-        for child in sorted(out.rglob("*")):
-            if child.is_file() and child.stat().st_size:
-                if ctx.enqueue_file(child, item, f"pcap:{proto}-object:{child.name}"):
-                    n += 1
-        if n:
-            ctx.log(f"  pcap {item.short}: exported {n} {proto} object(s)")
+    ctx.parallel([(lambda p=proto: _export_one(ctx, item, p)) for proto in OBJECT_PROTOCOLS])
 
 
 def _dns_exfil(ctx: Context, item: Item) -> None:
@@ -60,15 +64,17 @@ def _dns_exfil(ctx: Context, item: Item) -> None:
     names = [n.strip() for n in res.out_text().splitlines() if n.strip()]
     if not names:
         return
-    # Group by zone (everything after the first label); concatenate first labels
-    # in capture order -> the reassembled exfil channel.
+    # Group by the registrable zone (last two labels); concatenate ALL preceding
+    # labels of each name, in capture order, as that name's data. This keeps
+    # multi-label-per-query exfil (c1.c2.c3.zone.tld) instead of only the first
+    # label, while a single-data-label query (chunk.zone.tld) still reassembles.
     zones: dict[str, list[str]] = {}
     for name in names:
         labels = name.split(".")
-        if len(labels) < 2:
+        if len(labels) < 3:
             continue
-        zone = ".".join(labels[1:])
-        zones.setdefault(zone, []).append(labels[0])
+        zone = ".".join(labels[-2:])
+        zones.setdefault(zone, []).append("".join(labels[:-2]))
     for zone, chunks in zones.items():
         reassembled = "".join(chunks).encode()
         if len(reassembled) < 4:
@@ -97,10 +103,13 @@ def _dns_exfil(ctx: Context, item: Item) -> None:
 
 def _credentials(ctx: Context, item: Item) -> None:
     res = _tshark(ctx, item, ["-z", "credentials", "-q"], timeout=120)
-    if res.stdout.strip() and "no " not in res.out_text().lower()[:40]:
+    # tshark always prints a header/separator; only a real data row (which starts
+    # with a packet number) means credentials were actually found.
+    rows = [l for l in res.out_text().splitlines() if l.split() and l.split()[0].isdigit()]
+    if rows:
         ctx.emit(Finding(
             severity="high", handler="pcap", type="artifact",
-            value=f"credentials:\n{res.out_text().strip()[:1500]}", item_sha=item.sha256,
+            value="credentials:\n" + "\n".join(rows)[:1500], item_sha=item.sha256,
             provenance=item.provenance + ["pcap:credentials"], command=res.command,
         ))
 
@@ -127,24 +136,28 @@ def _fields(ctx: Context, item: Item) -> None:
                 ctx.decoder.decode_candidate(raw, item, item.provenance + [f"pcap:{label}"])
 
 
+def _follow_one(ctx: Context, item: Item, n: int) -> None:
+    fr = _tshark(ctx, item, ["-q", "-z", f"follow,tcp,raw,{n}"], timeout=60)
+    hexdata = "".join(
+        line.strip() for line in fr.out_text().splitlines()
+        if line.strip() and all(c in "0123456789abcdefABCDEF" for c in line.strip())
+    )
+    if len(hexdata) < 8:
+        return
+    try:
+        raw = bytes.fromhex(hexdata)
+    except ValueError:
+        return
+    dump = ctx.child_dir(item) / f"tcp_stream_{n}.bin"
+    dump.write_bytes(raw)
+    ctx.enqueue_file(dump, item, f"pcap:tcp-stream-{n}")
+
+
 def _follow_streams(ctx: Context, item: Item) -> None:
     res = _tshark(ctx, item, ["-T", "fields", "-e", "tcp.stream"], timeout=120)
-    streams = {int(s) for s in res.out_text().split() if s.isdigit()}
-    for n in sorted(streams)[:MAX_STREAMS]:
-        fr = _tshark(ctx, item, ["-q", "-z", f"follow,tcp,raw,{n}"], timeout=60)
-        hexdata = "".join(
-            line.strip() for line in fr.out_text().splitlines()
-            if line.strip() and all(c in "0123456789abcdefABCDEF" for c in line.strip())
-        )
-        if len(hexdata) < 8:
-            continue
-        try:
-            raw = bytes.fromhex(hexdata)
-        except ValueError:
-            continue
-        dump = ctx.child_dir(item) / f"tcp_stream_{n}.bin"
-        dump.write_bytes(raw)
-        ctx.enqueue_file(dump, item, f"pcap:tcp-stream-{n}")
+    streams = sorted({int(s) for s in res.out_text().split() if s.isdigit()})[:MAX_STREAMS]
+    # Each stream follow is an independent read-only tshark call; fan them out.
+    ctx.parallel([(lambda k=n: _follow_one(ctx, item, k)) for n in streams])
 
 
 def handle(item: Item, ctx: Context) -> None:

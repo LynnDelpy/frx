@@ -15,7 +15,6 @@ from pathlib import Path
 
 from ..engine.context import Context
 from ..engine.queue import Item
-from ..flags.scan import scan_flags
 from ..report.findings import Finding
 
 
@@ -36,15 +35,7 @@ def _subtype(item: Item) -> str:
 
 
 def _scan_and_decode(ctx: Context, item: Item, data: bytes, via: str, command: str | None = None) -> None:
-    for hit in scan_flags(data, ctx.formats):
-        if hit.confirmed:
-            v = hit.value.decode("utf-8", "replace")
-            ctx.emit(Finding(
-                severity="flag", handler="image", type="flag", value=v, item_sha=item.sha256,
-                flag=True, confidence=1.0, provenance=item.provenance + [via, v], command=command,
-            ))
-    if ctx.decoder is not None:
-        ctx.decoder.decode_candidate(data, item, item.provenance + [via])
+    ctx.scan_and_decode(item, data, via, "image", command)
 
 
 def _exiftool(ctx: Context, item: Item) -> None:

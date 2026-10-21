@@ -16,7 +16,6 @@ from pathlib import Path
 
 from ..engine.context import Context
 from ..engine.queue import Item
-from ..flags.scan import scan_flags
 from ..report.findings import Finding
 from . import vol
 
@@ -44,16 +43,7 @@ DUMPING_PLUGINS = {"windows.malfind.Malfind", "linux.malfind.Malfind", "mac.malf
 
 
 def _scan_output(ctx: Context, item: Item, text: str, plugin: str, command: str) -> None:
-    data = text.encode("utf-8", "replace")
-    for hit in scan_flags(data, ctx.formats):
-        if hit.confirmed:
-            v = hit.value.decode("utf-8", "replace")
-            ctx.emit(Finding(
-                severity="flag", handler="memory", type="flag", value=v, item_sha=item.sha256,
-                flag=True, confidence=1.0, provenance=item.provenance + [f"memory:{plugin}", v], command=command,
-            ))
-    if ctx.decoder is not None:
-        ctx.decoder.decode_candidate(data, item, item.provenance + [f"memory:{plugin}"])
+    ctx.scan_and_decode(item, text.encode("utf-8", "replace"), f"memory:{plugin}", "memory", command)
 
 
 def _banners(ctx: Context, item: Item) -> str:
@@ -90,22 +80,34 @@ def _detect_os(ctx: Context, item: Item, installed: set[str]) -> str:
 
 def _sweep(ctx: Context, item: Item, plugins: list[str], installed: set[str]) -> None:
     dump_dir = ctx.child_dir(item) / "voldump"
+    to_run = []
     for plugin in plugins:
         if plugin not in installed:
             ctx.log(f"  memory: plugin not installed, skipped: {plugin}")
-            continue
+        else:
+            to_run.append(plugin)
+
+    def run_one(plugin: str) -> None:
         dd = dump_dir if plugin in DUMPING_PLUGINS else None
         extra = ["--dump"] if plugin in DUMPING_PLUGINS else None
-        res = vol.run_plugin(ctx, item, plugin, extra=extra, dump_dir=dd)
+        # Isolated cache per plugin: concurrent vol processes must not race on
+        # the shared symbol cache files.
+        cache = ctx.case_dir / "vol-cache" / plugin
+        res = vol.run_plugin(ctx, item, plugin, extra=extra, dump_dir=dd, cache_dir=cache)
         if res.timed_out:
             ctx.log(f"  memory: plugin timed out, skipped: {plugin}")
-            continue
+            return
         if res.stdout.strip():
             _scan_output(ctx, item, res.out_text(), plugin, res.command)
+
+    # Each plugin re-reads the (multi-GB) dump, so cap the fan-out to limit I/O
+    # amplification even when --jobs is high.
+    ctx.parallel([(lambda p=p: run_one(p)) for p in to_run], limit=min(ctx.jobs, 4))
+
     # Enqueue any dumped regions/files.
     if dump_dir.is_dir():
         for child in sorted(dump_dir.rglob("*")):
-            if child.is_file() and child.stat().st_size:
+            if child.is_file() and not child.is_symlink() and child.stat().st_size:
                 ctx.enqueue_file(child, item, f"memory:dump:{child.name}")
 
 

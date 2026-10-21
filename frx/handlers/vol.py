@@ -43,10 +43,14 @@ def list_plugins(ctx: Context) -> set[str]:
 
 
 def run_plugin(ctx: Context, item: Item, plugin: str, extra: list[str] | None = None,
-               dump_dir: Path | None = None, timeout: float | None = None):
+               dump_dir: Path | None = None, timeout: float | None = None,
+               cache_dir: Path | None = None):
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    cache = cache_dir if cache_dir is not None else _cache_dir(ctx)
     argv = [
         "vol", "-q", "-r", "jsonl", "--offline",
-        "--cache-path", str(_cache_dir(ctx)),
+        "--cache-path", str(cache),
         "-s", str(symbols_dir(ctx)),
     ]
     if dump_dir is not None:
@@ -84,20 +88,25 @@ def build_isf(ctx: Context, vmlinux: str, system_map: str | None) -> Path | None
     out_dir = symbols_dir(ctx) / "linux"
     out_dir.mkdir(parents=True, exist_ok=True)
     name = Path(vmlinux).stem or "kernel"
-    raw_json = ctx.case_dir / "tmp" / f"{name}.json"
     argv = ["dwarf2json", "linux", "--elf", str(vmlinux)]
     if system_map:
         argv += ["--system-map", str(system_map)]
     res = ctx.runner.run(argv, timeout=ctx.runner.default_timeout)
     if res.returncode != 0 or not res.stdout:
         return None
-    raw_json.parent.mkdir(parents=True, exist_ok=True)
-    raw_json.write_bytes(res.stdout)
-    # xz-compress into the symbols dir (vol3 reads .json.xz).
+    # xz-compress into the symbols dir (vol3 reads .json.xz). Write to a unique
+    # temp and atomically rename so two dumps built in parallel for the same
+    # vmlinux cannot interleave their writes into a corrupt ISF.
     import lzma
+    import os
+    import threading
 
     dest = out_dir / f"{name}.json.xz"
-    with lzma.open(dest, "wb") as fh:
-        fh.write(res.stdout)
-    raw_json.unlink(missing_ok=True)
+    tmp = out_dir / f".{name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with lzma.open(tmp, "wb") as fh:
+            fh.write(res.stdout)
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
     return dest

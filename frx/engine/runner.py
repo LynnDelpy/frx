@@ -20,6 +20,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import threading
 from pathlib import Path
 
 
@@ -54,12 +55,26 @@ class Runner:
         default_timeout: float = 300.0,
         nice: bool = True,
         logfn=None,
+        observer=None,
+        concurrency=None,
     ):
         self.case_dir = Path(case_dir)
         self.default_timeout = default_timeout
         self.nice = nice and shutil.which("nice") is not None
         self.ionice = nice and shutil.which("ionice") is not None
         self._logfn = logfn
+        # A shared semaphore caps the TOTAL number of external tools running at
+        # once (across item workers and any handler-internal parallelism), so
+        # intra-handler fan-out never oversubscribes the machine.
+        self._concurrency = concurrency
+        # Optional live-UI hook: observer.tool_start(argv)/tool_end(argv) are
+        # called around each spawn so the per-worker display can show the tool
+        # that is running and for how long. Never allowed to break a run.
+        self._observer = observer
+        # Process groups of currently-running tools, so a hard abort (second
+        # Ctrl-C) can SIGKILL them instead of waiting on their timeouts.
+        self._active: set[int] = set()
+        self._active_lock = threading.Lock()
         self._tmp = self.case_dir / "tmp"
         self._tmp.mkdir(parents=True, exist_ok=True)
 
@@ -93,28 +108,129 @@ class Runner:
         wrapped = self._wrap(list(argv))
         if self._logfn:
             self._logfn("exec: " + " ".join(shlex.quote(a) for a in argv))
+        self._notify("tool_start", argv)
+        if self._concurrency is not None:
+            self._concurrency.acquire()
         start = time.monotonic()
         try:
-            proc = subprocess.Popen(
-                wrapped,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
-                cwd=str(cwd) if cwd else None,
-                env=self._env(env),
-                start_new_session=True,  # own process group, for clean kill
-            )
-        except (FileNotFoundError, PermissionError) as e:
-            return RunResult(list(argv), None, b"", b"", 0.0, error=str(e))
+            try:
+                proc = subprocess.Popen(
+                    wrapped,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+                    cwd=str(cwd) if cwd else None,
+                    env=self._env(env),
+                    start_new_session=True,  # own process group, for clean kill
+                )
+            except (FileNotFoundError, PermissionError) as e:
+                return RunResult(list(argv), None, b"", b"", 0.0, error=str(e))
+            # new session => child pid is its own process-group id.
+            with self._active_lock:
+                self._active.add(proc.pid)
+            try:
+                out, err = proc.communicate(input=input_bytes, timeout=timeout)
+                dur = time.monotonic() - start
+                return RunResult(list(argv), proc.returncode, out, err, dur)
+            except subprocess.TimeoutExpired:
+                self._kill_group(proc)
+                try:
+                    # Bounded: a process wedged in uninterruptible I/O can survive
+                    # even SIGKILL, so never let the worker block here forever.
+                    out, err = proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    out, err = b"", b""
+                dur = time.monotonic() - start
+                return RunResult(list(argv), proc.returncode, out or b"", err or b"", dur, timed_out=True)
+            finally:
+                with self._active_lock:
+                    self._active.discard(proc.pid)
+        finally:
+            if self._concurrency is not None:
+                self._concurrency.release()
+            self._notify("tool_end", argv)
+
+    def run_to_file(
+        self,
+        argv: list[str],
+        out_fh,
+        timeout: float | None = None,
+        cwd: Path | None = None,
+        env: dict | None = None,
+    ) -> RunResult:
+        """Run a tool, streaming its stdout straight into `out_fh`.
+
+        For tools whose output can be huge (strings / blkls over a multi-GB
+        image), capturing stdout through a pipe would buffer it all in RAM. Here
+        the OS writes stdout directly to the file; only stderr (small) is piped,
+        so there is no large-output pipe deadlock and RAM stays bounded. The
+        returned RunResult has empty stdout (it is in the file).
+        """
+        import time
+
+        timeout = self.default_timeout if timeout is None else timeout
+        wrapped = self._wrap(list(argv))
+        if self._logfn:
+            self._logfn("exec: " + " ".join(shlex.quote(a) for a in argv))
+        self._notify("tool_start", argv)
+        if self._concurrency is not None:
+            self._concurrency.acquire()
+        start = time.monotonic()
         try:
-            out, err = proc.communicate(input=input_bytes, timeout=timeout)
-            dur = time.monotonic() - start
-            return RunResult(list(argv), proc.returncode, out, err, dur)
-        except subprocess.TimeoutExpired:
-            self._kill_group(proc)
-            out, err = proc.communicate()
-            dur = time.monotonic() - start
-            return RunResult(list(argv), proc.returncode, out or b"", err or b"", dur, timed_out=True)
+            try:
+                proc = subprocess.Popen(
+                    wrapped,
+                    stdout=out_fh,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.DEVNULL,
+                    cwd=str(cwd) if cwd else None,
+                    env=self._env(env),
+                    start_new_session=True,
+                )
+            except (FileNotFoundError, PermissionError) as e:
+                return RunResult(list(argv), None, b"", b"", 0.0, error=str(e))
+            with self._active_lock:
+                self._active.add(proc.pid)
+            try:
+                _, err = proc.communicate(timeout=timeout)
+                dur = time.monotonic() - start
+                return RunResult(list(argv), proc.returncode, b"", err or b"", dur)
+            except subprocess.TimeoutExpired:
+                self._kill_group(proc)
+                try:
+                    _, err = proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    err = b""
+                dur = time.monotonic() - start
+                return RunResult(list(argv), proc.returncode, b"", err or b"", dur, timed_out=True)
+            finally:
+                with self._active_lock:
+                    self._active.discard(proc.pid)
+        finally:
+            if self._concurrency is not None:
+                self._concurrency.release()
+            self._notify("tool_end", argv)
+
+    def kill_all(self) -> None:
+        """SIGKILL every running tool's process group (hard-abort path)."""
+        with self._active_lock:
+            pids = list(self._active)
+        for pid in pids:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+    def _notify(self, event: str, argv: list[str]) -> None:
+        if self._observer is None:
+            return
+        fn = getattr(self._observer, event, None)
+        if fn is None:
+            return
+        try:
+            fn(argv)
+        except Exception:
+            pass
 
     @staticmethod
     def _kill_group(proc: subprocess.Popen) -> None:
