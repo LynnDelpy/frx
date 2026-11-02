@@ -24,11 +24,15 @@ uv tool install --editable .
 #    (or, without uv:)
 #    python -m venv .venv && . .venv/bin/activate && pip install -e .
 
-# 2. see what external tools/symbols/wordlists are needed, and the commands
-frx setup                 # prints pacman / AUR / pipx / gem install lines
-frx setup --with-wordlists   # also prints the wordlist download commands
+# 2. install the external tools. `frx setup` runs the installs for you:
+#    pacman (via sudo, which prompts), AUR (paru/yay), pipx, gem, the vol3
+#    symbol packs, and the unpackaged helper scripts.
+frx setup                     # install everything
+frx setup --with-wordlists    # also fetch rockyou (enables auto-cracking, below)
+frx setup --yes               # unattended (passes --noconfirm to the package managers)
+frx setup --dry-run           # just print the commands, install nothing
 
-# 3. install those (they need sudo, so you run them), then verify
+# 3. verify before a long run
 frx check                 # table of every tool + the offline sandbox + GPU
 ```
 
@@ -72,6 +76,22 @@ frx run dump.bin --flag-regex 'picoCTF\{[a-z0-9_]+\}'    # exact regex, repeatab
 | `recon` | fast, read-only: identify, metadata, protocol/partition summaries   |
 | `full`  | everything: carve, extract, follow streams, stego, vol3 sweep, recurse |
 
+## Automatic cracking
+
+In `full` mode, encrypted archives and stego carriers are brute-forced for you,
+no flags required:
+
+- Encrypted zips go through `zip2john` + `john`; other encrypted archives
+  (7z/rar) through a capped `7z` password loop.
+- Stego images go through `stegseek` (and a `steghide` empty-passphrase try).
+
+These use a wordlist. If you do not pass `--wordlist`, frx auto-selects a
+rockyou list when one is installed (it looks in
+`~/.local/share/frx/wordlists/rockyou.txt`, then `/usr/share/wordlists/`). Run
+`frx setup --with-wordlists` once and cracking then happens automatically; `frx
+check` shows whether a wordlist was found. The number of attempts is capped so a
+single archive cannot stall the whole run.
+
 ## Common options
 
 | option | meaning |
@@ -86,7 +106,7 @@ frx run dump.bin --flag-regex 'picoCTF\{[a-z0-9_]+\}'    # exact regex, repeatab
 | `--max-depth N` / `--max-files N` / `--max-extracted-size 4G` | zip-bomb / recursion guards |
 | `--build-isf vmlinux [--system-map map]` | build a vol3 Linux ISF, then analyze |
 | `--kind memory\|pcap\|disk\|...` | force the input type instead of detecting it |
-| `--wordlist FILE` | wordlist for archive-password / stego brute force |
+| `--wordlist FILE` | wordlist for cracking (defaults to rockyou if installed) |
 | `--no-sandbox` | do not network-isolate the pass (required for `--mount`) |
 | `--mount` | last-resort read-only loop mount (needs `--no-sandbox`) |
 | `--gpu` | experimental OpenCL XOR acceleration (see [Performance](#performance)) |

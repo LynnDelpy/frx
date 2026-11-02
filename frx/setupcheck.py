@@ -128,71 +128,120 @@ def _load_manifest() -> dict:
     return {}
 
 
-def run_setup(with_wordlists: bool = False, isf_only: bool = False, yes: bool = False) -> int:
+def _run_cmd(argv: list[str], dry_run: bool, require: str | None = None):
+    """Print a command, then (unless dry_run) run it with the terminal attached
+    so sudo/pacman can prompt. Returns True ok, False failed, None skipped."""
+    print("  $ " + " ".join(argv))
+    if dry_run:
+        return None
+    if require and shutil.which(require) is None:
+        print(f"    skipped: {require} not found")
+        return None
+    try:
+        return subprocess.run(argv).returncode == 0
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"    failed: {e}")
+        return False
+
+
+def run_setup(with_wordlists: bool = False, isf_only: bool = False,
+              yes: bool = False, dry_run: bool = False) -> int:
+    """Install frx's external dependencies. Runs the commands directly (package
+    installs use sudo and will prompt); --dry-run only prints them, --yes passes
+    --noconfirm to the package managers for an unattended install."""
     manifest = _load_manifest()
-    print("frx setup prints the commands to run; package installs need sudo (run them yourself).\n")
+    nc = ["--noconfirm"] if yes else []
+    if dry_run:
+        print("frx setup (dry run): the commands below would run; nothing is executed.\n")
+    else:
+        print("frx setup: installing dependencies. Package installs use sudo and may prompt.\n")
 
     if isf_only:
-        _print_tools(manifest)
-        print("\n(--isf-only: skipping packages, symbol packs, and wordlists.)")
-        return 0
+        _setup_tools(manifest, dry_run)
+        return 0 if dry_run else run_check()
 
     pac = manifest.get("pacman", {}).get("pkgs", [])
-    aur = manifest.get("aur", {}).get("pkgs", [])
-    pipx = manifest.get("pipx", {}).get("pkgs", [])
-    gem = manifest.get("gem", {}).get("pkgs", [])
     if pac:
-        print("Official packages:\n  sudo pacman -S --needed " + " ".join(pac) + "\n")
-    if aur:
-        print("AUR packages (paru or yay):\n  paru -S --needed " + " ".join(aur) + "\n")
-    if pipx:
-        print("Python tools (vol/olevba on PATH; pipx or uv tool):\n  pipx install " + " && pipx install ".join(pipx) + "\n")
-    if gem:
-        print("Ruby gems (if not using the AUR build):\n  gem install --user-install " + " ".join(gem) + "\n")
+        if dry_run or shutil.which("pacman"):
+            _run_cmd(["sudo", "pacman", "-S", "--needed", *nc, *pac], dry_run, require="pacman")
+        else:
+            print("  pacman not found (not an Arch host); install equivalently: " + " ".join(pac))
 
-    _print_tools(manifest)
-    _print_symbols(manifest)
+    aur = manifest.get("aur", {}).get("pkgs", [])
+    if aur:
+        helper = shutil.which("paru") or shutil.which("yay")
+        if dry_run:
+            print("  $ paru -S --needed " + " ".join(nc + aur))
+        elif helper:
+            _run_cmd([Path(helper).name, "-S", "--needed", *nc, *aur], dry_run)
+        else:
+            print("  no AUR helper (paru/yay); install from the AUR yourself: " + " ".join(aur))
+
+    for p in manifest.get("pipx", {}).get("pkgs", []):
+        _run_cmd(["pipx", "install", p], dry_run, require="pipx")
+    for g in manifest.get("gem", {}).get("pkgs", []):
+        _run_cmd(["gem", "install", "--user-install", g], dry_run, require="gem")
+
+    _setup_tools(manifest, dry_run)
+    _setup_symbols(manifest, dry_run)
     if with_wordlists:
-        _print_wordlists(manifest)
+        _setup_wordlists(manifest, dry_run)
     else:
-        print("\nWordlists: re-run `frx setup --with-wordlists` to print their download commands.")
-    print("\nAfter installing, run `frx check` to verify everything resolves before a long pass.")
-    return 0
+        print("\nwordlists: re-run `frx setup --with-wordlists` to fetch rockyou (enables auto-cracking).")
+
+    if dry_run:
+        print("\n(dry run complete; re-run without --dry-run to install.)")
+        return 0
+    print("\nVerifying with `frx check`:\n")
+    return run_check()
 
 
 def _symbols_dir() -> Path:
     return Path(Config().vol_symbols).expanduser()
 
 
-def _print_tools(manifest: dict) -> None:
+def _setup_tools(manifest: dict, dry_run: bool) -> None:
     tools = manifest.get("tools", {})
     if not tools:
         return
     dest = Path("~/.local/share/frx/tools").expanduser()
-    print(f"Unpackaged tools -> {dest}:")
-    if "dwarf2json" in tools:
-        print(f"  dwarf2json: download the release binary from {tools['dwarf2json']} and put it on PATH")
+    if not dry_run:
+        dest.mkdir(parents=True, exist_ok=True)
+    print(f"\nunpackaged tools -> {dest}:")
     for key in ("pdfid", "pdf_parser"):
         if key in tools:
-            print(f"  {key.replace('_', '-')}.py: curl -L {tools[key]} -o {dest}/{key.replace('_', '-')}.py")
+            name = key.replace("_", "-") + ".py"
+            _run_cmd(["curl", "-fsSL", "-o", str(dest / name), tools[key]], dry_run, require="curl")
+    if "dwarf2json" in tools:
+        print(f"  dwarf2json: download the release binary from {tools['dwarf2json']} and put it on "
+              "PATH (choosing the right release asset is manual).")
 
 
-def _print_symbols(manifest: dict) -> None:
+def _setup_symbols(manifest: dict, dry_run: bool) -> None:
     sym = manifest.get("symbols", {})
     if not sym:
         return
     base = _symbols_dir()
     print(f"\nvol3 symbol packs -> {base}:")
     for family in ("windows", "mac"):
-        if family in sym:
-            print(f"  {family}: curl -L {sym[family]} -o /tmp/{family}.zip && "
-                  f"unzip -o /tmp/{family}.zip -d {base}/{family}")
+        if family not in sym:
+            continue
+        out = base / family
+        zpath = base / f"{family}.zip"
+        if not dry_run:
+            out.mkdir(parents=True, exist_ok=True)
+        ok = _run_cmd(["curl", "-fsSL", "-o", str(zpath), sym[family]], dry_run, require="curl")
+        if dry_run or ok:
+            _run_cmd(["7z", "x", "-y", f"-o{out}", str(zpath)], dry_run, require="7z")
 
 
-def _print_wordlists(manifest: dict) -> None:
+def _setup_wordlists(manifest: dict, dry_run: bool) -> None:
     wl = manifest.get("wordlists", {})
     if not wl:
         return
-    print("\nWordlists:")
+    dest = Path("~/.local/share/frx/wordlists").expanduser()
+    if not dry_run:
+        dest.mkdir(parents=True, exist_ok=True)
+    print(f"\nwordlists -> {dest}:")
     for name, url in wl.items():
-        print(f"  {name}: curl -L {url} -o ~/.local/share/frx/wordlists/{name}.txt")
+        _run_cmd(["curl", "-fsSL", "-o", str(dest / f"{name}.txt"), url], dry_run, require="curl")
