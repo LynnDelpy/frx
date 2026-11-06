@@ -97,6 +97,28 @@ def test_scan_and_decode_emits_confirmed_and_candidates(tmp_path):
     assert any(t == "flag_candidate" for t, _ in pairs)   # foo{bar} -> candidate, not dropped
 
 
+def test_default_wordlist_autodetects_rockyou(tmp_path, monkeypatch):
+    from frx import config as cfgmod
+
+    wl = tmp_path / "rockyou.txt"
+    wl.write_text("password\n123456\n")
+    # Point the search path at our temp rockyou; absent -> None.
+    monkeypatch.setattr(cfgmod, "_WORDLIST_PATHS", (str(wl), "/nope/rockyou.txt"))
+    assert cfgmod.default_wordlist() == str(wl)
+    monkeypatch.setattr(cfgmod, "_WORDLIST_PATHS", ("/nope/a.txt", "/nope/b.txt"))
+    assert cfgmod.default_wordlist() is None
+
+
+def test_config_load_uses_default_wordlist(tmp_path, monkeypatch):
+    from frx import config as cfgmod
+
+    wl = tmp_path / "rockyou.txt"
+    wl.write_text("x\n")
+    monkeypatch.setattr(cfgmod, "_WORDLIST_PATHS", (str(wl),))
+    cfg = cfgmod.Config.load(path=tmp_path / "no-such-config.toml")
+    assert cfg.wordlist == str(wl)  # auto-selected so cracking runs without --wordlist
+
+
 def test_parse_size_and_duration_reject_bad_values():
     assert parse_size("4G") == 4 * 1024**3
     assert parse_duration("40m") == 2400

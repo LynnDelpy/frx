@@ -254,7 +254,8 @@ def cmd_check(args) -> int:
 def cmd_setup(args) -> int:
     from .setupcheck import run_setup
 
-    return run_setup(with_wordlists=args.with_wordlists, isf_only=args.isf_only, yes=args.yes)
+    return run_setup(with_wordlists=args.with_wordlists, isf_only=args.isf_only,
+                     yes=args.yes, dry_run=args.dry_run)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -297,10 +298,11 @@ def build_parser() -> argparse.ArgumentParser:
     c = sub.add_parser("check", help="verify dependencies")
     c.set_defaults(func=cmd_check)
 
-    s = sub.add_parser("setup", help="print install commands")
-    s.add_argument("--yes", action="store_true")
-    s.add_argument("--with-wordlists", action="store_true")
-    s.add_argument("--isf-only", action="store_true")
+    s = sub.add_parser("setup", help="install dependencies")
+    s.add_argument("--yes", action="store_true", help="pass --noconfirm to the package managers")
+    s.add_argument("--with-wordlists", action="store_true", help="also fetch rockyou (enables auto-cracking)")
+    s.add_argument("--isf-only", action="store_true", help="only the unpackaged tools (dwarf2json, pdf scripts)")
+    s.add_argument("--dry-run", dest="dry_run", action="store_true", help="print the commands without running them")
     s.set_defaults(func=cmd_setup)
     return p
 

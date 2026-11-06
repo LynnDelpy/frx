@@ -252,12 +252,13 @@ def test_run_check_returns_int_without_crashing():
     assert rc in (0, 1)  # 1 here because the forensic tools are not installed
 
 
-def test_run_setup_prints_and_returns_zero(capsys):
+def test_run_setup_dry_run_prints_and_runs_nothing(capsys):
     from frx.setupcheck import run_setup
 
-    assert run_setup(with_wordlists=True) == 0
+    assert run_setup(with_wordlists=True, dry_run=True) == 0
     out = capsys.readouterr().out
     assert "pacman -S" in out and "symbol packs" in out.lower()
+    assert "dry run" in out.lower()  # nothing executed
 
 
 # -- budget stops the engine --------------------------------------------
