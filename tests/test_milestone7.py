@@ -456,6 +456,10 @@ def test_render_dedupes_nonflag_sections(tmp_path):
     from frx.report.render import render
 
     recs = [
+        # a confirmed flag so the "no flags" leads block (which also lists leads)
+        # is not rendered; this test is about section-level dedup.
+        {"severity": "flag", "handler": "decode", "type": "flag", "value": "CTF{z}",
+         "item_sha": "z", "provenance": ["img", "CTF{z}"], "flag": True},
         {"severity": "high", "handler": "disk", "type": "artifact", "value": "deleted entry: x",
          "item_sha": "a", "provenance": ["img", "disk"]},
         {"severity": "high", "handler": "disk", "type": "artifact", "value": "deleted entry: x",

@@ -97,6 +97,41 @@ def test_scan_and_decode_emits_confirmed_and_candidates(tmp_path):
     assert any(t == "flag_candidate" for t, _ in pairs)   # foo{bar} -> candidate, not dropped
 
 
+def test_summarize_classifies_limits_and_suggests_next_steps(tmp_path):
+    from frx.report.render import summarize
+
+    (tmp_path / "run-meta.json").write_text('{"mode":"full","flag_formats":["CTF{...}"]}')
+    recs = [
+        {"severity": "high", "handler": "memory", "type": "artifact",
+         "value": "memory dump not analyzable past banners: no matching symbols",
+         "item_sha": "a", "provenance": ["m", "memory:no-symbols"]},
+        {"severity": "high", "handler": "archive", "type": "artifact",
+         "value": "encrypted archive: s.zip", "item_sha": "b", "provenance": ["s.zip", "archive:encrypted"]},
+        {"severity": "info", "handler": "binary", "type": "flag_candidate",
+         "value": "key{x}", "item_sha": "c", "provenance": ["x", "raw", "key{x}"]},
+    ]
+    (tmp_path / "findings.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+    s = summarize(tmp_path)
+    assert len(s["limits"]) == 2 and len(s["candidates"]) == 1
+    joined = " ".join(s["suggestions"])
+    assert "build-isf" in joined and "with-wordlists" in joined
+
+
+def test_no_flag_report_shows_leads_and_next_steps(tmp_path):
+    from frx.cli import main
+
+    inp = tmp_path / "in.txt"
+    inp.write_bytes(b"nothing to see here\n")
+    case = tmp_path / "case"
+    rc = main(["run", str(inp), "--mode", "recon", "--flag-format", "CTF{...}",
+               "--case", str(case), "--no-sandbox", "--no-progress"])
+    assert rc == 0
+    report = (case / "report.md").read_text()
+    assert "No flags confirmed" in report
+    assert "Try next" in report
+    assert "--mode full" in report  # recon -> suggests a full run
+
+
 def test_default_wordlist_autodetects_rockyou(tmp_path, monkeypatch):
     from frx import config as cfgmod
 

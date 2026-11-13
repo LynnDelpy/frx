@@ -221,8 +221,26 @@ def cmd_run(args) -> int:
         print(f"flags:  {flags_txt}")
         print(flags_txt.read_text().rstrip())
     else:
-        print("flags:  none confirmed")
+        _print_no_flag_summary(case_dir)
     return rc
+
+
+def _print_no_flag_summary(case_dir: Path) -> None:
+    """A miss should still be useful: show the leads, what was not analyzed, and
+    the top next steps, not just 'none confirmed'."""
+    from .report.render import summarize
+
+    s = summarize(case_dir)
+    print("flags:  none confirmed")
+    print(f"        analyzed {s['items']} item(s); leads: {len(s['candidates'])} candidate(s), "
+          f"{len(s['decoded'])} decoded, {len(s['artifacts'])} artifact(s), "
+          f"{len(s['limits'])} not-fully-analyzed")
+    for f in s["candidates"][:3]:
+        print(f"        candidate: {f['value']}  [{' -> '.join(f.get('provenance', []))}]")
+    for f in s["limits"][:3]:
+        print(f"        limit:     {f['value']}")
+    for i, sug in enumerate(s["suggestions"][:3]):
+        print(("  next:   " if i == 0 else "          ") + sug)
 
 
 def _drive(engine: Engine, ui, console) -> None:
